@@ -1,10 +1,13 @@
 # pith
 
-Integration guards for Go: dedupe, debounce, quota cap, ...
+Protect Integration THresholds with Go: dedupe + per-key cap policies (debounce, quota, custom).
 
 ## Packages
 
-- [`pith/dedupe`](dedupe/) — short-window deduplication of repeated operations by caller-supplied string key
+- [`pith/sendstate`](sendstate/) — shared per-key record (content-hash, last sent, last deferred, last deferred message-ref) plus internal rolling send-timestamp list and lifetime counters; the read + write surface all mechanisms layer over
+- [`pith/dedupe`](dedupe/) — short-window content-hash dedupe by caller-supplied string key; one-method read-only policy (`SeenInWindow`) over `sendstate.Store`
+- [`pith/coalesce`](coalesce/) — per-key cap policy ("at most hardCap successful sends per window"); one-method read-only policy (`ShouldDefer`) over `sendstate.Store.CountInWindow`. Multiple Coalescers can be attached at different `(hardCap, window)` pairs
+- [`pith/protect`](protect/) — composition layer; `Check` applies dedupe + each attached Coalescer in order, returns `DecisionDeferred` on the first hit, and stamps a deferred-breadcrumb on sendstate for any Coalescer-driven defer. `RecordAsSent` is a single sendstate write that updates the timestamp list + lifetime counters. `Metrics(ctx, key)` exposes per-key observability (TotalSent, TotalDeferred, LastSentAt, LastDeferredAt)
 
 ## Documentation
 

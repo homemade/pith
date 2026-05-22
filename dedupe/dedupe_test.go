@@ -1,18 +1,23 @@
-package dedupe
+package dedupe_test
 
 import (
 	"context"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/homemade/pith/dedupe"
+	"github.com/homemade/pith/sendstate"
 )
 
-func TestMemoryDeduper_SeenAndRecord(t *testing.T) {
-	d := NewMemoryDeduper()
+func TestDeduper_SeenAfterRecord(t *testing.T) {
+	s := sendstate.NewMemoryStore()
+	d := dedupe.NewDeduper(s, time.Hour)
 	ctx := context.Background()
-	key := "dedupe:webhook:c1:t1:abc123"
+	key := "c1:t1"
+	content := "abc123"
 
-	seen, err := d.SeenInWindow(ctx, key)
+	seen, err := d.SeenInWindow(ctx, key, content)
 	if err != nil {
 		t.Fatalf("unexpected error on first SeenInWindow: %v", err)
 	}
@@ -20,56 +25,94 @@ func TestMemoryDeduper_SeenAndRecord(t *testing.T) {
 		t.Fatalf("expected miss on first lookup")
 	}
 
-	if err := d.RecordSent(ctx, key, time.Hour); err != nil {
-		t.Fatalf("unexpected error on RecordSent: %v", err)
+	if err := s.RecordAsSent(ctx, key, content); err != nil {
+		t.Fatalf("unexpected error on Record: %v", err)
 	}
 
-	seen, err = d.SeenInWindow(ctx, key)
+	seen, err = d.SeenInWindow(ctx, key, content)
 	if err != nil {
 		t.Fatalf("unexpected error on second SeenInWindow: %v", err)
 	}
 	if !seen {
-		t.Fatalf("expected hit after RecordSent")
+		t.Fatalf("expected hit after Record")
 	}
 }
 
-func TestMemoryDeduper_TTLExpiry(t *testing.T) {
-	d := NewMemoryDeduper()
+func TestDeduper_SameKeyDifferentContentMisses(t *testing.T) {
+	s := sendstate.NewMemoryStore()
+	d := dedupe.NewDeduper(s, time.Hour)
 	ctx := context.Background()
-	key := "dedupe:webhook:c1:t1:short"
+	key := "c1:t1"
 
-	if err := d.RecordSent(ctx, key, 10*time.Millisecond); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if err := s.RecordAsSent(ctx, key, "hash-A"); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	seen, err := d.SeenInWindow(ctx, key, "hash-B")
+	if err != nil {
+		t.Fatalf("SeenInWindow: %v", err)
+	}
+	if seen {
+		t.Fatalf("different content for the same key should miss")
+	}
+}
+
+func TestDeduper_WindowExpiry(t *testing.T) {
+	s := sendstate.NewMemoryStore()
+	d := dedupe.NewDeduper(s, 10*time.Millisecond)
+	ctx := context.Background()
+	key := "c1:t1"
+	content := "short"
+
+	if err := s.RecordAsSent(ctx, key, content); err != nil {
+		t.Fatalf("Record: %v", err)
 	}
 	time.Sleep(25 * time.Millisecond)
 
-	seen, err := d.SeenInWindow(ctx, key)
+	seen, err := d.SeenInWindow(ctx, key, content)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("SeenInWindow: %v", err)
 	}
 	if seen {
-		t.Fatalf("expected expired entry to miss")
+		t.Fatalf("expected entry older than window to miss")
 	}
 }
 
-func TestMemoryDeduper_RecordRefreshesExpiry(t *testing.T) {
-	d := NewMemoryDeduper()
+func TestDeduper_RecordRefreshesLastSentAt(t *testing.T) {
+	s := sendstate.NewMemoryStore()
+	d := dedupe.NewDeduper(s, 10*time.Millisecond)
 	ctx := context.Background()
-	key := "dedupe:webhook:c1:t1:refresh"
+	key := "c1:t1"
+	content := "refresh"
 
-	_ = d.RecordSent(ctx, key, 10*time.Millisecond)
+	_ = s.RecordAsSent(ctx, key, content)
+	time.Sleep(15 * time.Millisecond)
+	_ = s.RecordAsSent(ctx, key, content)
 	time.Sleep(5 * time.Millisecond)
-	_ = d.RecordSent(ctx, key, time.Hour)
-	time.Sleep(10 * time.Millisecond)
 
-	seen, _ := d.SeenInWindow(ctx, key)
+	// 20ms passed since the first Record, but only 5ms since the
+	// second. A 10ms window should still hit because LastSentAt was
+	// refreshed.
+	seen, _ := d.SeenInWindow(ctx, key, content)
 	if !seen {
-		t.Fatalf("second RecordSent should refresh expiry")
+		t.Fatalf("second Record should refresh LastSentAt")
 	}
 }
 
-func TestMemoryDeduper_Concurrent(t *testing.T) {
-	d := NewMemoryDeduper()
+func TestNewMemoryDeduper_StandaloneConvenience(t *testing.T) {
+	d := dedupe.NewMemoryDeduper(time.Hour)
+	seen, err := d.SeenInWindow(context.Background(), "k", "c")
+	if err != nil {
+		t.Fatalf("SeenInWindow: %v", err)
+	}
+	if seen {
+		t.Fatalf("fresh deduper should miss")
+	}
+}
+
+func TestDeduper_Concurrent(t *testing.T) {
+	s := sendstate.NewMemoryStore()
+	d := dedupe.NewDeduper(s, time.Hour)
 	ctx := context.Background()
 
 	var wg sync.WaitGroup
@@ -77,9 +120,9 @@ func TestMemoryDeduper_Concurrent(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			key := "dedupe:webhook:c1:t1:k" + string(rune('a'+i%26))
-			_ = d.RecordSent(ctx, key, time.Hour)
-			_, _ = d.SeenInWindow(ctx, key)
+			key := "c1:t1:k" + string(rune('a'+i%26))
+			_ = s.RecordAsSent(ctx, key, "content")
+			_, _ = d.SeenInWindow(ctx, key, "content")
 		}(i)
 	}
 	wg.Wait()

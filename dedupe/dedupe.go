@@ -1,89 +1,95 @@
 // Package dedupe provides short-window suppression of repeated
-// operations keyed by a caller-supplied string.
+// operations: for a given key, the same content sent again within
+// the window is reported as suppressed.
 //
-// The contract is record-on-success: callers register a key only after
-// the gated operation has actually succeeded, so transport failures
-// don't lock out legitimate retries.
+// dedupe is a read-only policy layer over a [sendstate.Store]. The
+// store owns the "(key → most-recent content-hash, last-sent-at)"
+// record; dedupe answers "is contentHash X for key K within the
+// trailing window?" by consulting the store. Writes — recording a
+// successful send — go through the store directly (typically via
+// [pith/protect.Protector.RecordAsSent] or [sendstate.Store.RecordAsSent]
+// for standalone use).
 //
-// A common key-construction pattern is to hash the stable content of
-// the operation and prefix the hash with any scoping identifiers the
-// application needs (tenant, resource, …). See
-// [Example_contentHashKey].
+// The window is supplied once at construction (see [NewDeduper]) and
+// applied to every [Deduper.SeenInWindow] call. It's a deployment
+// setting, not a per-call decision; callers that need different
+// windows over the same store should construct multiple Deduper
+// instances.
+//
+// Common patterns for (key, contentHash):
+//
+//   - Per-target dedupe — key = "{resource}:{target}", contentHash =
+//     hash of the message. Same content for the same target is
+//     suppressed; the same content for a different target proceeds.
+//   - Cross-target dedupe — key = "" or a fixed scope, contentHash =
+//     hash of the message. Same content anywhere within the scope
+//     is suppressed.
+//   - Pure equality — key = the content itself, contentHash = "".
+//     The classic "have I seen this token before" pattern.
+//
+// See [Example_contentHashKey].
 package dedupe
 
 import (
 	"context"
-	"sync"
-	"sync/atomic"
 	"time"
+
+	"github.com/homemade/pith/sendstate"
 )
 
-// Deduper tracks recently-recorded keys within a time-to-live window.
+// Deduper reports whether a recent send for the given key carried
+// the same content-hash as the supplied one, within the trailing
+// window the Deduper was constructed with.
 type Deduper interface {
-	// SeenInWindow reports whether key has a non-expired entry
-	// recorded by a prior successful operation.
+	// SeenInWindow reports true when the [sendstate.Store] holds a
+	// record for key whose ContentHash equals the supplied
+	// contentHash AND whose LastSentAt is within the Deduper's
+	// trailing window.
 	//
-	//   true  → suppress (caller should skip the operation).
-	//   false → proceed (caller should perform the operation, then
-	//                    call RecordSent on success).
+	//   true  → recent match → suppress.
+	//   false → no record, outside window, or different content →
+	//                    proceed and the caller records on success.
 	//
 	// Backing-store failures must be treated as fail-open by callers
-	// (return false), so a dedupe outage degrades to "operation
+	// (return false), so a sendstate outage degrades to "operation
 	// proceeds" rather than dropping legitimate work.
-	SeenInWindow(ctx context.Context, key string) (bool, error)
-
-	// RecordSent registers key with the given TTL. Idempotent — a
-	// second RecordSent for the same key refreshes the expiry.
-	RecordSent(ctx context.Context, key string, ttl time.Duration) error
+	SeenInWindow(ctx context.Context, key, contentHash string) (bool, error)
 }
 
-// MemoryDeduper is an in-process Deduper backed by a sync.Map. It is
-// best-effort within one process; entries recorded in one process are
-// invisible to others. Use a shared-backing implementation when
-// cross-process coordination is required.
-type MemoryDeduper struct {
-	entries sync.Map // key: string → value: time.Time (expiry instant)
-	ops     atomic.Uint64
+// storeDeduper is the default [Deduper] implementation: a thin
+// policy over a [sendstate.Store] with a fixed window.
+type storeDeduper struct {
+	store  sendstate.Store
+	window time.Duration
 }
 
-// NewMemoryDeduper returns a ready-to-use MemoryDeduper.
-func NewMemoryDeduper() *MemoryDeduper {
-	return &MemoryDeduper{}
+// NewDeduper returns a Deduper backed by the supplied
+// [sendstate.Store], applying window on every SeenInWindow call.
+// Use this constructor when the same store is shared with other
+// mechanisms (e.g. [pith/coalesce] under [pith/protect.Protector]);
+// each layer's policy then reads from one record per key.
+func NewDeduper(store sendstate.Store, window time.Duration) Deduper {
+	return &storeDeduper{store: store, window: window}
 }
 
-// SeenInWindow reports whether key has a non-expired entry. Expired
-// entries are treated as a miss.
-func (m *MemoryDeduper) SeenInWindow(_ context.Context, key string) (bool, error) {
-	v, ok := m.entries.Load(key)
+// NewMemoryDeduper returns a Deduper backed by a private in-process
+// [sendstate.MemoryStore] with the supplied window. Convenient for
+// standalone use (tests, examples, single-process deployments where
+// dedupe is the only mechanism reading the store).
+func NewMemoryDeduper(window time.Duration) Deduper {
+	return NewDeduper(sendstate.NewMemoryStore(), window)
+}
+
+func (d *storeDeduper) SeenInWindow(ctx context.Context, key, contentHash string) (bool, error) {
+	e, ok, err := d.store.Lookup(ctx, key)
+	if err != nil {
+		return false, err
+	}
 	if !ok {
 		return false, nil
 	}
-	expiry := v.(time.Time)
-	if !time.Now().Before(expiry) {
-		m.entries.Delete(key)
+	if !time.Now().Before(e.LastSentAt.Add(d.window)) {
 		return false, nil
 	}
-	return true, nil
-}
-
-// RecordSent stores key with expiry now+ttl. Overwrites any existing
-// entry for the same key (refreshes the expiry).
-func (m *MemoryDeduper) RecordSent(_ context.Context, key string, ttl time.Duration) error {
-	m.entries.Store(key, time.Now().Add(ttl))
-	if m.ops.Add(1)%1000 == 0 {
-		m.sweep()
-	}
-	return nil
-}
-
-// sweep removes all expired entries. Triggered every ~1000 writes by
-// RecordSent so memory doesn't grow unbounded for never-revisited keys.
-func (m *MemoryDeduper) sweep() {
-	now := time.Now()
-	m.entries.Range(func(k, v interface{}) bool {
-		if !now.Before(v.(time.Time)) {
-			m.entries.Delete(k)
-		}
-		return true
-	})
+	return e.ContentHash == contentHash, nil
 }

@@ -10,27 +10,33 @@ import (
 	"time"
 
 	"github.com/homemade/pith/dedupe"
+	"github.com/homemade/pith/sendstate"
 )
 
-// Example_contentHashKey shows the typical key-construction pattern
-// for deduplicating operations whose stable bytes are derivable from
-// the application's own data.
+// Example_contentHashKey shows the typical pattern for deduplicating
+// operations whose stable bytes are derivable from the application's
+// own data.
 //
 // The pattern:
 //
-//  1. Canonicalise the operation's content (sorted keys for stable
+//  1. Use a stable scope identifier (here, profileID) as the dedupe
+//     key — the "slot" each operation lands in.
+//  2. Canonicalise the operation's content (sorted keys for stable
 //     JSON) so map iteration order doesn't leak into the hash.
-//  2. sha256 the canonical bytes and hex-encode a prefix as the
+//  3. sha256 the canonical bytes and hex-encode a prefix as the
 //     content fingerprint.
-//  3. Build the key from the scope (here, profileID) plus the hash.
 //  4. Skip when SeenInWindow returns true; otherwise perform the
-//     operation and RecordSent on success.
+//     operation and RecordAsSent on the sendstate.Store on success.
+//
+// Same scope + same content within window is suppressed; either a
+// content change for the same scope or the same content under a
+// different scope proceeds.
 func Example_contentHashKey() {
-	d := dedupe.NewMemoryDeduper()
+	store := sendstate.NewMemoryStore()
+	d := dedupe.NewDeduper(store, time.Hour)
 	ctx := context.Background()
-	ttl := time.Hour
 
-	hashKey := func(scope string, body map[string]any) string {
+	contentHash := func(body map[string]any) string {
 		keys := make([]string, 0, len(body))
 		for k := range body {
 			keys = append(keys, k)
@@ -42,18 +48,18 @@ func Example_contentHashKey() {
 		}
 		canon, _ := json.Marshal(ordered)
 		sum := sha256.Sum256(canon)
-		return scope + ":" + hex.EncodeToString(sum[:8])
+		return hex.EncodeToString(sum[:8])
 	}
 
 	handle := func(scope string, body map[string]any) {
-		key := hashKey(scope, body)
-		seen, _ := d.SeenInWindow(ctx, key)
+		content := contentHash(body)
+		seen, _ := d.SeenInWindow(ctx, scope, content)
 		if seen {
 			fmt.Printf("skip: %s raised=%v\n", scope, body["raised"])
 			return
 		}
 		fmt.Printf("send: %s raised=%v\n", scope, body["raised"])
-		_ = d.RecordSent(ctx, key, ttl)
+		_ = store.RecordAsSent(ctx, scope, content)
 	}
 
 	// First call for this scope+content: recorded.
@@ -62,7 +68,7 @@ func Example_contentHashKey() {
 	handle("p-1", map[string]any{"goal": 1000, "raised": 350})
 	// Content change (raised: 350 → 425) → different hash, proceeds.
 	handle("p-1", map[string]any{"goal": 1000, "raised": 425})
-	// Same body, different scope (p-2) → different key, proceeds.
+	// Same body, different scope (p-2) → different slot, proceeds.
 	handle("p-2", map[string]any{"goal": 1000, "raised": 425})
 
 	// Output:
