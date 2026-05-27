@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/homemade/pith/coalesce"
-	"github.com/homemade/pith/dedupe"
 	"github.com/homemade/pith/protect"
 	"github.com/homemade/pith/sendstate"
 	"github.com/joineduptech/doc/sequencerec"
@@ -15,20 +14,10 @@ import (
 
 // Recording wrappers around each mechanism so calls from
 // Protector.Check / RecordAsSent show up in the diagram as their
-// outermost arrows. The inner CountInWindow reads driven by
-// Coalescer.ShouldDefer are not recorded — the diagram stays at
-// the mechanism-call abstraction.
-
-type recordingDeduper struct {
-	inner dedupe.Deduper
-	rec   *sequencerec.Recorder
-}
-
-func (r *recordingDeduper) SeenInWindow(ctx context.Context, key, contentHash string) (bool, error) {
-	seen, err := r.inner.SeenInWindow(ctx, key, contentHash)
-	r.rec.Record("Dedupe", "SeenInWindow", []any{key, contentHash}, []any{seen, err})
-	return seen, err
-}
+// outermost arrows. Protector.Check fetches one Entry up-front and
+// feeds it to every policy — the diagram shows that as a single
+// ReadEntry arrow followed by pure-function policy arrows that don't
+// go back to the store.
 
 // recordingCap wraps a coalesce.Coalescer and tags its diagram
 // participant with a caller-supplied name (e.g. "Debounce",
@@ -39,21 +28,43 @@ type recordingCap struct {
 	name  string
 }
 
-func (r *recordingCap) ShouldDefer(ctx context.Context, key string) (bool, error) {
-	d, err := r.inner.ShouldDefer(ctx, key)
-	r.rec.Record(r.name, "ShouldDefer", []any{key}, []any{d, err})
-	return d, err
+func (r *recordingCap) ShouldDefer(entry sendstate.Entry, now time.Time) bool {
+	d := r.inner.ShouldDefer(entry, now)
+	r.rec.Record(r.name, "ShouldDefer", nil, []any{d})
+	return d
 }
 
-// recordingSendStore wraps a [sendstate.Store] so the write surface
-// used by Protector.Check / RecordAsSent surfaces in the diagram.
-// CountInWindow reads driven by ShouldDefer are intentionally not
-// recorded here — they'd push arrows ahead of their parent
-// ShouldDefer call (sequencerec records on return); leaving them
-// silent keeps the diagram at the mechanism-call abstraction.
+func (r *recordingCap) CapPolicy() (hardCap int, window time.Duration) {
+	return r.inner.CapPolicy()
+}
+
+// recordingSendStore wraps a [sendstate.Store] so the read + write
+// surface used by Protector.Check / RecordAsSent surfaces in the
+// diagram. ReadEntry is recorded explicitly — it's the single read
+// per Check that drives every downstream policy.
 type recordingSendStore struct {
 	inner sendstate.Store
 	rec   *sequencerec.Recorder
+}
+
+func (r *recordingSendStore) ReadEntry(ctx context.Context, key string) (sendstate.Entry, error) {
+	entry, err := r.inner.ReadEntry(ctx, key)
+	r.rec.Record("SendState", "ReadEntry", []any{key}, []any{"entry", err})
+	return entry, err
+}
+
+func (r *recordingSendStore) ReadMetrics(ctx context.Context, key string) (sendstate.Metrics, bool, error) {
+	return r.inner.ReadMetrics(ctx, key)
+}
+
+func (r *recordingSendStore) RaisePeaks(ctx context.Context, key string, counts map[string]uint64) error {
+	err := r.inner.RaisePeaks(ctx, key, counts)
+	r.rec.Record("SendState", "RaisePeaks", []any{key, fmt.Sprintf("%v", counts)}, []any{err})
+	return err
+}
+
+func (r *recordingSendStore) RangeDeferred(ctx context.Context, limit int, fn func(key string, e sendstate.Entry) bool) error {
+	return r.inner.RangeDeferred(ctx, limit, fn)
 }
 
 func (r *recordingSendStore) RecordAsSent(ctx context.Context, key, contentHash string) error {
@@ -68,18 +79,6 @@ func (r *recordingSendStore) RecordAsDeferred(ctx context.Context, key string, m
 	return err
 }
 
-func (r *recordingSendStore) Lookup(ctx context.Context, key string) (sendstate.Entry, bool, error) {
-	return r.inner.Lookup(ctx, key)
-}
-
-func (r *recordingSendStore) CountInWindow(ctx context.Context, key string, window time.Duration) (int, error) {
-	return r.inner.CountInWindow(ctx, key, window)
-}
-
-func (r *recordingSendStore) Metrics(ctx context.Context, key string) (sendstate.Metrics, bool, error) {
-	return r.inner.Metrics(ctx, key)
-}
-
 // TestProtectorScenarios exercises each [protect.Protector.Check]
 // decision branch and emits a Mermaid sequence diagram next to this
 // file (sequence_test.md).
@@ -89,29 +88,26 @@ func TestProtectorScenarios(t *testing.T) {
 
 	const capWindow = 24 * time.Hour
 	// Short debounce window so the at-cap scenario below can wait
-	// it out and exercise the quota Coalescer's ShouldDefer arrow
-	// distinctly. Realistic deployments use seconds-to-minutes.
+	// it out and exercise the quota Coalescer's ShouldDefer
+	// arrow distinctly. Realistic deployments use seconds-to-minutes.
 	const debounceWindow = 30 * time.Millisecond
 	const hardCap = 2
 
-	innerStore := sendstate.NewMemoryStore()
+	innerStore := sendstate.NewMemoryStore(capWindow)
 	recStore := &recordingSendStore{inner: innerStore, rec: rec}
-	innerDedupe := dedupe.NewDeduper(recStore, capWindow)
-	innerDebounce := coalesce.NewCoalescer(recStore, 1, debounceWindow)
-	innerQuota := coalesce.NewCoalescer(recStore, hardCap, capWindow)
+	innerDebounce := coalesce.NewCoalescer(1, debounceWindow)
+	innerQuota := coalesce.NewCoalescer(hardCap, capWindow)
 
-	// Wire debounce *before* quota so the diagram evaluates the
-	// short-window cap first (cheaper / source-driven check).
+	// Content dedupe is always applied via sendstate.Entry.Seen
+	// (no Coalescer to wrap), so it shows in the diagram only as the
+	// Check outcome, not a separate participant. Wire debounce
+	// *before* quota so the diagram evaluates the short-window cap
+	// first (cheaper / source-driven check).
 	p := protect.New(
 		protect.WithSendStore(recStore),
-		// Dedupe needs the cap window to be configured; supply it
-		// without attaching the default quota Coalescer (we attach a
-		// wrapped one below via WithCoalescerImpl). Using WithCap
-		// here would double-attach.
-		protect.WithDeduperImpl(&recordingDeduper{inner: innerDedupe, rec: rec}),
 		protect.WithCoalescerImpl(
 			&recordingCap{inner: innerDebounce, rec: rec, name: "Debounce"},
-			"debounce window",
+			"leading-edge debounce window",
 		),
 		protect.WithCoalescerImpl(
 			&recordingCap{inner: innerQuota, rec: rec, name: "Quota"},
@@ -143,7 +139,7 @@ func TestProtectorScenarios(t *testing.T) {
 
 	rec.Run(t, "duplicate content to the same target is deferred", func(t *testing.T) {
 		req := protect.Request{
-			ContentHash: "hash-A",           // same content as scenario 1
+			ContentHash: "hash-A",          // same content as scenario 1
 			TargetKey:   "act-1:contact-1", // same target as scenario 1
 			MessageRef:  []byte("activity-A-dup"),
 		}
@@ -160,7 +156,7 @@ func TestProtectorScenarios(t *testing.T) {
 
 	rec.Run(t, "same-target follow-up within debounce window is deferred", func(t *testing.T) {
 		req := protect.Request{
-			ContentHash: "hash-B",           // new content
+			ContentHash: "hash-B",          // new content
 			TargetKey:   "act-1:contact-1", // same target as scenario 1
 			MessageRef:  []byte("activity-B"),
 		}
@@ -172,8 +168,8 @@ func TestProtectorScenarios(t *testing.T) {
 		if out.Decision != protect.DecisionDeferred {
 			t.Fatalf("want Deferred, got %s", out.Decision)
 		}
-		if out.Reason != "debounce window" {
-			t.Fatalf("want Reason=\"debounce window\", got %q", out.Reason)
+		if out.Reason != "leading-edge debounce window" {
+			t.Fatalf("want Reason=\"leading-edge debounce window\", got %q", out.Reason)
 		}
 		rec.Note(fmt.Sprintf("→ %s (%s) — deferred breadcrumb stamped", out.Decision, out.Reason))
 	})

@@ -1,4 +1,4 @@
-package dedupe_test
+package sendstate_test
 
 import (
 	"context"
@@ -9,31 +9,29 @@ import (
 	"sort"
 	"time"
 
-	"github.com/homemade/pith/dedupe"
 	"github.com/homemade/pith/sendstate"
 )
 
-// Example_contentHashKey shows the typical pattern for deduplicating
-// operations whose stable bytes are derivable from the application's
-// own data.
+// Example_contentHashDedupe shows the typical content-dedupe pattern:
+// suppress re-sending an operation whose content is byte-identical to
+// the last successful send for the same key.
 //
 // The pattern:
 //
-//  1. Use a stable scope identifier (here, profileID) as the dedupe
-//     key — the "slot" each operation lands in.
+//  1. Use a stable scope identifier (here, profileID) as the key —
+//     the "slot" each operation lands in.
 //  2. Canonicalise the operation's content (sorted keys for stable
 //     JSON) so map iteration order doesn't leak into the hash.
 //  3. sha256 the canonical bytes and hex-encode a prefix as the
 //     content fingerprint.
-//  4. Skip when SeenInWindow returns true; otherwise perform the
-//     operation and RecordAsSent on the sendstate.Store on success.
+//  4. Read the entry for the key and skip when [Entry.Seen] reports
+//     the same fingerprint; otherwise perform the operation and
+//     RecordAsSent on success.
 //
-// Same scope + same content within window is suppressed; either a
-// content change for the same scope or the same content under a
-// different scope proceeds.
-func Example_contentHashKey() {
-	store := sendstate.NewMemoryStore()
-	d := dedupe.NewDeduper(store, time.Hour)
+// Same scope + same content is suppressed; a content change for the
+// same scope, or the same content under a different scope, proceeds.
+func Example_contentHashDedupe() {
+	store := sendstate.NewMemoryStore(24 * time.Hour)
 	ctx := context.Background()
 
 	contentHash := func(body map[string]any) string {
@@ -53,8 +51,8 @@ func Example_contentHashKey() {
 
 	handle := func(scope string, body map[string]any) {
 		content := contentHash(body)
-		seen, _ := d.SeenInWindow(ctx, scope, content)
-		if seen {
+		entry, _ := store.ReadEntry(ctx, scope)
+		if entry.Seen(content) {
 			fmt.Printf("skip: %s raised=%v\n", scope, body["raised"])
 			return
 		}

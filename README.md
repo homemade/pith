@@ -4,10 +4,18 @@ Protect Integration THresholds with Go: dedupe + per-key cap policies (debounce,
 
 ## Packages
 
-- [`pith/sendstate`](sendstate/) — shared per-key record (content-hash, last sent, last deferred, last deferred message-ref) plus internal rolling send-timestamp list and lifetime counters; the read + write surface all mechanisms layer over
-- [`pith/dedupe`](dedupe/) — short-window content-hash dedupe by caller-supplied string key; one-method read-only policy (`SeenInWindow`) over `sendstate.Store`
-- [`pith/coalesce`](coalesce/) — per-key cap policy ("at most hardCap successful sends per window"); one-method read-only policy (`ShouldDefer`) over `sendstate.Store.CountInWindow`. Multiple Coalescers can be attached at different `(hardCap, window)` pairs
-- [`pith/protect`](protect/) — composition layer; `Check` applies dedupe + each attached Coalescer in order, returns `DecisionDeferred` on the first hit, and stamps a deferred-breadcrumb on sendstate for any Coalescer-driven defer. `RecordAsSent` is a single sendstate write that updates the timestamp list + lifetime counters. `Metrics(ctx, key)` exposes per-key observability (TotalSent, TotalDeferred, LastSentAt, LastDeferredAt)
+- [`pith/sendstate`](sendstate/) — shared per-key state split across two stores (mirroring two backend collections): the TTL'd **`Entry`** (content-hash, last-deferred message-ref, rolling send-timestamp list) read via `ReadEntry`, and the permanent **`Metrics`** rollup (lifetime counters + last-sent/deferred times) read via `ReadMetrics`. `Entry` carries the read primitives directly: `Seen(contentHash)` (content dedupe — is this identical to the last send?), `CountInWindow(now, window)` (per-window send count), and its deferral mirror `CountDeferredInWindow(now, window)` (deferral cadence, for replay-sweep eligibility — e.g. trailing-edge "gone quiet" == 0). The `Entry` store behaves like a Mongo TTL index (`expireAt` + `expireAfterSeconds: 0`) with TTL-honoring reads, so expiry never affects answers. A send touches only send-side state — a deferral is "pending" purely by being more recent than the last send (nothing is cleared)
+- [`pith/coalesce`](coalesce/) — per-key cap policy ("at most hardCap successful sends per window"); one-method read-only policy (`ShouldDefer`), a pure function over a `sendstate.Entry` (via `Entry.CountInWindow`). Multiple Coalescers can be attached at different `(hardCap, window)` pairs
+- [`pith/protect`](protect/) — composition layer; `Check` always applies content dedupe (`Entry.Seen`) then each attached Coalescer in order, returns `DecisionDeferred` on the first hit, and stamps a deferred-breadcrumb on sendstate for any Coalescer-driven defer. `RecordAsSent` updates the `Entry` + `Metrics` stores. On every proceed it raises each cap's high-water mark (post-send in-window count). `Metrics(ctx, key)` exposes per-key observability (TotalSent, TotalDeferred, LastSentAt, LastDeferredAt, and per-cap `PeakSendsInWindow`). `RangeDeferredWithCapsClear(ctx, limit, fn)` drives a consumer-side replay sweep over pending deferrals (oldest-first), invoking `fn` only for entries whose cap windows have elapsed (skipping ones that would just defer again), to be re-derived and re-emitted via `Check`
+
+## Backends
+
+Today the in-memory implementations from `sendstate` and `coalesce` are wired up
+by default — process-local, for tests/examples/single-process use. A shared
+backend is required for multi-instance deployments; see
+[docs/mongo-store.md](docs/mongo-store.md) for a full Mongo `sendstate.Store`
+implementation sketch (two TTL'd/permanent collections, `$max` peak merges,
+TTL-honoring reads).
 
 ## Documentation
 
