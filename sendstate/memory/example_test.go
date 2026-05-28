@@ -1,4 +1,4 @@
-package sendstate_test
+package memory_test
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/homemade/pith/sendstate"
+	"github.com/homemade/pith/sendstate/memory"
 )
 
 // Example_contentHashDedupe shows the typical content-dedupe pattern:
@@ -24,14 +24,14 @@ import (
 //     JSON) so map iteration order doesn't leak into the hash.
 //  3. sha256 the canonical bytes and hex-encode a prefix as the
 //     content fingerprint.
-//  4. Read the entry for the key and skip when [Entry.Seen] reports
+//  4. Read the entry for the key and skip when [sendstate.Entry.Seen] reports
 //     the same fingerprint; otherwise perform the operation and
 //     RecordAsSent on success.
 //
 // Same scope + same content is suppressed; a content change for the
 // same scope, or the same content under a different scope, proceeds.
 func Example_contentHashDedupe() {
-	store := sendstate.NewMemoryStore(24 * time.Hour)
+	store := memory.New(24 * time.Hour)
 	ctx := context.Background()
 
 	contentHash := func(body map[string]any) string {

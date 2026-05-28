@@ -4,39 +4,36 @@ import (
 	"testing"
 	"time"
 
+	"github.com/homemade/pith/coalesce"
 	"github.com/homemade/pith/protect"
-	"github.com/homemade/pith/sendstate"
+	"github.com/homemade/pith/sendstate/memory"
 )
 
-// New sizes the MemoryStore's send-timestamp list to the largest
-// attached Coalescer cap so CountInWindow can't undercount.
+// New sizes the memory store's send-timestamp list to the largest
+// attached Coalescer cap so CountSentInWindow can't undercount.
 func TestNew_SizesMaxSendTimesToLargestCap(t *testing.T) {
-	p := protect.New(
-		protect.WithSendStore(sendstate.NewMemoryStore(24*time.Hour)),
-		protect.WithLeadingEdgeDebounce(10*time.Second), // hardCap 1
-		protect.WithCap(50, 24*time.Hour),               // hardCap 50
-		protect.WithCoalescer(5, time.Minute, "burst"),  // hardCap 5
+	store := memory.New(24 * time.Hour)
+	_ = protect.New(
+		store,
+		protect.WithCoalescer(coalesce.NewLeadingEdgeDebounce(10*time.Second)), // hardCap 1
+		protect.WithCoalescer(coalesce.NewQuota(50, 24*time.Hour)),             // hardCap 50
+		protect.WithCoalescer(coalesce.NewQuota(5, time.Minute)),               // hardCap 5 (burst)
 	)
-	ms, ok := p.SendStore().(*sendstate.MemoryStore)
-	if !ok {
-		t.Fatalf("default store is not *sendstate.MemoryStore")
-	}
-	if ms.MaxSendTimes != 50 {
-		t.Fatalf("MaxSendTimes = %d, want 50 (largest attached cap)", ms.MaxSendTimes)
+	if store.MaxSendTimes != 50 {
+		t.Fatalf("MaxSendTimes = %d, want 50 (largest attached cap)", store.MaxSendTimes)
 	}
 }
 
 // Grow-only: a caller who pre-sizes their own store above the
-// largest cap keeps that value (e.g. to cover a WithCoalescerImpl).
+// largest cap keeps that value (e.g. to cover a custom WithCoalescer).
 func TestNew_PreservesLargerManualCap(t *testing.T) {
-	store := sendstate.NewMemoryStore(24 * time.Hour)
+	store := memory.New(24 * time.Hour)
 	store.MaxSendTimes = 1000
-	p := protect.New(
-		protect.WithSendStore(store),
-		protect.WithCap(50, 24*time.Hour),
+	_ = protect.New(
+		store,
+		protect.WithCoalescer(coalesce.NewQuota(50, 24*time.Hour)),
 	)
-	ms := p.SendStore().(*sendstate.MemoryStore)
-	if ms.MaxSendTimes != 1000 {
-		t.Fatalf("MaxSendTimes = %d, want 1000 (grow-only must not shrink)", ms.MaxSendTimes)
+	if store.MaxSendTimes != 1000 {
+		t.Fatalf("MaxSendTimes = %d, want 1000 (grow-only must not shrink)", store.MaxSendTimes)
 	}
 }

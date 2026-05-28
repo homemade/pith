@@ -1,4 +1,4 @@
-package sendstate
+package memory
 
 import (
 	"bytes"
@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/homemade/pith/sendstate"
 )
 
 // testTTL is generously larger than any window/sleep used in these
@@ -13,7 +15,7 @@ import (
 const testTTL = time.Hour
 
 func TestMemoryStore_RecordAsSentThenRead(t *testing.T) {
-	s := NewMemoryStore(testTTL)
+	s := New(testTTL)
 	ctx := context.Background()
 
 	if err := s.RecordAsSent(ctx, "k1", "hash-A"); err != nil {
@@ -50,7 +52,7 @@ func TestMemoryStore_RecordAsSentThenRead(t *testing.T) {
 }
 
 func TestMemoryStore_ReadMiss(t *testing.T) {
-	s := NewMemoryStore(testTTL)
+	s := New(testTTL)
 	ctx := context.Background()
 
 	entry, err := s.ReadEntry(ctx, "missing")
@@ -66,7 +68,7 @@ func TestMemoryStore_ReadMiss(t *testing.T) {
 }
 
 func TestMemoryStore_RecordAsSentOverwrites(t *testing.T) {
-	s := NewMemoryStore(testTTL)
+	s := New(testTTL)
 	ctx := context.Background()
 
 	_ = s.RecordAsSent(ctx, "k1", "hash-A")
@@ -86,7 +88,7 @@ func TestMemoryStore_RecordAsSentOverwrites(t *testing.T) {
 }
 
 func TestMemoryStore_RecordAsDeferred(t *testing.T) {
-	s := NewMemoryStore(testTTL)
+	s := New(testTTL)
 	ctx := context.Background()
 
 	if err := s.RecordAsDeferred(ctx, "k1", []byte("ref-A")); err != nil {
@@ -140,7 +142,7 @@ func TestMemoryStore_RecordAsDeferred(t *testing.T) {
 }
 
 func TestEntry_CountDeferredInWindow(t *testing.T) {
-	s := NewMemoryStore(testTTL)
+	s := New(testTTL)
 	ctx := context.Background()
 
 	entry, _ := s.ReadEntry(ctx, "missing")
@@ -159,8 +161,8 @@ func TestEntry_CountDeferredInWindow(t *testing.T) {
 		t.Fatalf("CountDeferredInWindow = %d, want 2 (send must not clear deferrals)", n)
 	}
 	// Sends stay on their own list.
-	if n := entry.CountInWindow(now, time.Hour); n != 1 {
-		t.Fatalf("CountInWindow = %d, want 1", n)
+	if n := entry.CountSentInWindow(now, time.Hour); n != 1 {
+		t.Fatalf("CountSentInWindow = %d, want 1", n)
 	}
 	// Tight window: trailing-edge "gone quiet" reads zero.
 	if n := entry.CountDeferredInWindow(now, 0); n != 0 {
@@ -169,7 +171,7 @@ func TestEntry_CountDeferredInWindow(t *testing.T) {
 }
 
 func TestEntry_Seen(t *testing.T) {
-	s := NewMemoryStore(testTTL)
+	s := New(testTTL)
 	ctx := context.Background()
 
 	entry, _ := s.ReadEntry(ctx, "k1")
@@ -193,13 +195,13 @@ func TestEntry_Seen(t *testing.T) {
 	}
 }
 
-func TestEntry_CountInWindow(t *testing.T) {
-	s := NewMemoryStore(testTTL)
+func TestEntry_CountSentInWindow(t *testing.T) {
+	s := New(testTTL)
 	ctx := context.Background()
 
 	entry, _ := s.ReadEntry(ctx, "missing")
-	if n := entry.CountInWindow(time.Now(), time.Hour); n != 0 {
-		t.Fatalf("CountInWindow on miss = %d, want 0", n)
+	if n := entry.CountSentInWindow(time.Now(), time.Hour); n != 0 {
+		t.Fatalf("CountSentInWindow on miss = %d, want 0", n)
 	}
 
 	for i := 0; i < 3; i++ {
@@ -207,16 +209,16 @@ func TestEntry_CountInWindow(t *testing.T) {
 	}
 	entry, _ = s.ReadEntry(ctx, "k1")
 	now := time.Now()
-	if n := entry.CountInWindow(now, time.Hour); n != 3 {
-		t.Fatalf("CountInWindow = %d, want 3", n)
+	if n := entry.CountSentInWindow(now, time.Hour); n != 3 {
+		t.Fatalf("CountSentInWindow = %d, want 3", n)
 	}
-	if n := entry.CountInWindow(now, 0); n != 0 {
-		t.Fatalf("CountInWindow(0) = %d, want 0", n)
+	if n := entry.CountSentInWindow(now, 0); n != 0 {
+		t.Fatalf("CountSentInWindow(0) = %d, want 0", n)
 	}
 }
 
-func TestEntry_CountInWindowExpiry(t *testing.T) {
-	s := NewMemoryStore(testTTL)
+func TestEntry_CountSentInWindowExpiry(t *testing.T) {
+	s := New(testTTL)
 	ctx := context.Background()
 
 	_ = s.RecordAsSent(ctx, "k1", "h")
@@ -225,16 +227,16 @@ func TestEntry_CountInWindowExpiry(t *testing.T) {
 
 	entry, _ := s.ReadEntry(ctx, "k1")
 	now := time.Now()
-	if n := entry.CountInWindow(now, 10*time.Millisecond); n != 1 {
-		t.Fatalf("CountInWindow(10ms) = %d, want 1", n)
+	if n := entry.CountSentInWindow(now, 10*time.Millisecond); n != 1 {
+		t.Fatalf("CountSentInWindow(10ms) = %d, want 1", n)
 	}
-	if n := entry.CountInWindow(now, 50*time.Millisecond); n != 2 {
-		t.Fatalf("CountInWindow(50ms) = %d, want 2", n)
+	if n := entry.CountSentInWindow(now, 50*time.Millisecond); n != 2 {
+		t.Fatalf("CountSentInWindow(50ms) = %d, want 2", n)
 	}
 }
 
 func TestMemoryStore_LastNSendTimesCap(t *testing.T) {
-	s := NewMemoryStore(testTTL)
+	s := New(testTTL)
 	s.MaxSendTimes = 3
 	ctx := context.Background()
 
@@ -258,7 +260,7 @@ func TestMemoryStore_LastNSendTimesCap(t *testing.T) {
 }
 
 func TestMemoryStore_ReadEntryHonorsTTL(t *testing.T) {
-	s := NewMemoryStore(testTTL)
+	s := New(testTTL)
 	ctx := context.Background()
 	_ = s.RecordAsSent(ctx, "k1", "hash-A")
 
@@ -278,7 +280,7 @@ func TestMemoryStore_ReadEntryHonorsTTL(t *testing.T) {
 }
 
 func TestMemoryStore_SweepDeletesExpiredEntriesKeepsMetrics(t *testing.T) {
-	s := NewMemoryStore(testTTL)
+	s := New(testTTL)
 	ctx := context.Background()
 	_ = s.RecordAsSent(ctx, "k1", "hash-A")
 
@@ -302,46 +304,14 @@ func TestMemoryStore_SweepDeletesExpiredEntriesKeepsMetrics(t *testing.T) {
 	}
 }
 
-func TestMemoryStore_RaisePeaks(t *testing.T) {
-	s := NewMemoryStore(testTTL)
-	ctx := context.Background()
-
-	_ = s.RaisePeaks(ctx, "k1", map[string]uint64{"at cap": 3, "burst": 2})
-	met, ok, _ := s.ReadMetrics(ctx, "k1")
-	if !ok || met.PeakSendsInWindow["at cap"] != 3 || met.PeakSendsInWindow["burst"] != 2 {
-		t.Fatalf("after first raise: %+v (ok=%v)", met.PeakSendsInWindow, ok)
-	}
-
-	_ = s.RaisePeaks(ctx, "k1", map[string]uint64{"at cap": 5, "burst": 1, "daily": 10})
-	met, _, _ = s.ReadMetrics(ctx, "k1")
-	if met.PeakSendsInWindow["at cap"] != 5 {
-		t.Fatalf(`"at cap" should rise to 5, got %d`, met.PeakSendsInWindow["at cap"])
-	}
-	if met.PeakSendsInWindow["burst"] != 2 {
-		t.Fatalf(`"burst" should stay 2 (lower ignored), got %d`, met.PeakSendsInWindow["burst"])
-	}
-	if met.PeakSendsInWindow["daily"] != 10 {
-		t.Fatalf(`"daily" should be added as 10, got %d`, met.PeakSendsInWindow["daily"])
-	}
-
-	_ = s.RecordAsSent(ctx, "k1", "h")
-	met, _, _ = s.ReadMetrics(ctx, "k1")
-	if met.TotalSent != 1 {
-		t.Fatalf("TotalSent = %d, want 1", met.TotalSent)
-	}
-	if met.PeakSendsInWindow["at cap"] != 5 {
-		t.Fatalf("RecordAsSent must preserve peaks, got %+v", met.PeakSendsInWindow)
-	}
-
-	met.PeakSendsInWindow["at cap"] = 999
-	again, _, _ := s.ReadMetrics(ctx, "k1")
-	if again.PeakSendsInWindow["at cap"] != 5 {
-		t.Fatalf("stored peak mutated through returned map: %d", again.PeakSendsInWindow["at cap"])
-	}
-}
+// TODO(peaks): when [sendstate.Metrics.PeakSendsInWindow] is wired back
+// in (see the matching TODO on [sendstate.Store]), add a
+// TestMemoryStore_PeakSendsInWindowOnRecord that exercises the per-cap
+// max-merge folded into RecordAsSent and RecordAsDeferred. The earlier
+// version was removed alongside the peak observability code itself.
 
 func TestMemoryStore_RangeDeferred(t *testing.T) {
-	s := NewMemoryStore(testTTL)
+	s := New(testTTL)
 	ctx := context.Background()
 
 	// k-not-pending: deferral then a later send → superseded (excluded).
@@ -360,7 +330,7 @@ func TestMemoryStore_RangeDeferred(t *testing.T) {
 
 	// Unbounded: only the pending keys, oldest-first.
 	var got []string
-	_ = s.RangeDeferred(ctx, 0, func(key string, e Entry) bool {
+	_ = s.RangeDeferred(ctx, 0, func(key string, e sendstate.Entry) bool {
 		got = append(got, key)
 		if string(e.LastDeferredMessageRef) == "" {
 			t.Fatalf("%s yielded without a breadcrumb", key)
@@ -374,7 +344,7 @@ func TestMemoryStore_RangeDeferred(t *testing.T) {
 
 	// Bounded: limit picks the oldest N.
 	var bounded []string
-	_ = s.RangeDeferred(ctx, 2, func(key string, _ Entry) bool {
+	_ = s.RangeDeferred(ctx, 2, func(key string, _ sendstate.Entry) bool {
 		bounded = append(bounded, key)
 		return true
 	})
@@ -384,7 +354,7 @@ func TestMemoryStore_RangeDeferred(t *testing.T) {
 
 	// fn returning false stops early.
 	count := 0
-	_ = s.RangeDeferred(ctx, 0, func(string, Entry) bool {
+	_ = s.RangeDeferred(ctx, 0, func(string, sendstate.Entry) bool {
 		count++
 		return false
 	})
@@ -395,7 +365,7 @@ func TestMemoryStore_RangeDeferred(t *testing.T) {
 	// A successful send on k2 makes it no longer pending.
 	_ = s.RecordAsSent(ctx, "k2", "h")
 	got = nil
-	_ = s.RangeDeferred(ctx, 0, func(key string, _ Entry) bool {
+	_ = s.RangeDeferred(ctx, 0, func(key string, _ sendstate.Entry) bool {
 		got = append(got, key)
 		return true
 	})
@@ -405,7 +375,7 @@ func TestMemoryStore_RangeDeferred(t *testing.T) {
 }
 
 func TestMemoryStore_Concurrent(t *testing.T) {
-	s := NewMemoryStore(testTTL)
+	s := New(testTTL)
 	ctx := context.Background()
 
 	var wg sync.WaitGroup
