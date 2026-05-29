@@ -96,10 +96,6 @@ func (m *Store) GrowMaxSendTimes(n int) {
 // ref and LastNDeferredTimes are preserved; the newer send timestamp
 // is what makes any prior deferral no longer pending. The documented
 // race with concurrent RecordAsDeferred is accepted.
-//
-// TODO(peaks): [sendstate.Metrics.PeakSendsInWindow] is intentionally
-// not populated in the initial release. The Store interface comment
-// describes the shape the recording methods will grow when we revisit.
 func (m *Store) RecordAsSent(_ context.Context, key, contentHash string) error {
 	now := time.Now()
 	expireAt := now.Add(m.ttl)
@@ -148,8 +144,9 @@ func (m *Store) RecordAsSent(_ context.Context, key, contentHash string) error {
 		v, ok := m.metrics.Load(key)
 		if !ok {
 			fresh := &sendstate.Metrics{
-				TotalSent:  1,
-				LastSentAt: now,
+				TotalSent:   1,
+				FirstSentAt: now,
+				LastSentAt:  now,
 			}
 			if _, loaded := m.metrics.LoadOrStore(key, fresh); !loaded {
 				break
@@ -157,12 +154,19 @@ func (m *Store) RecordAsSent(_ context.Context, key, contentHash string) error {
 			continue
 		}
 		prev := v.(*sendstate.Metrics)
-		// next := *prev preserves TotalDeferred and LastDeferredAt —
-		// the last-deferred timestamp is lifetime and never cleared; a
-		// later send just makes LastSentAt exceed it.
+		// next := *prev preserves TotalDeferred, FirstDeferredAt, and
+		// LastDeferredAt — the deferred-side timestamps are lifetime and
+		// never cleared; a later send just makes LastSentAt exceed
+		// LastDeferredAt.
 		next := *prev
 		next.TotalSent = prev.TotalSent + 1
 		next.LastSentAt = now
+		// FirstSentAt is set-once. The metrics doc could have been
+		// created on a prior deferral (TotalSent == 0 path), so check
+		// the field itself rather than assuming "fresh doc means first".
+		if next.FirstSentAt.IsZero() {
+			next.FirstSentAt = now
+		}
 		if m.metrics.CompareAndSwap(key, prev, &next) {
 			break
 		}
@@ -177,8 +181,6 @@ func (m *Store) RecordAsSent(_ context.Context, key, contentHash string) error {
 // refreshes the Entry TTL, and advances the deferred-side metrics.
 // Preserves ContentHash and LastNSendTimes. CAS-loops so concurrent
 // calls don't clobber each other's writes.
-//
-// TODO(peaks): see the matching note on RecordAsSent.
 func (m *Store) RecordAsDeferred(_ context.Context, key string, messageRef []byte) error {
 	now := time.Now()
 	expireAt := now.Add(m.ttl)
@@ -223,8 +225,9 @@ func (m *Store) RecordAsDeferred(_ context.Context, key string, messageRef []byt
 		v, ok := m.metrics.Load(key)
 		if !ok {
 			fresh := &sendstate.Metrics{
-				TotalDeferred:  1,
-				LastDeferredAt: now,
+				TotalDeferred:   1,
+				FirstDeferredAt: now,
+				LastDeferredAt:  now,
 			}
 			if _, loaded := m.metrics.LoadOrStore(key, fresh); !loaded {
 				break
@@ -235,6 +238,12 @@ func (m *Store) RecordAsDeferred(_ context.Context, key string, messageRef []byt
 		next := *prev
 		next.TotalDeferred = prev.TotalDeferred + 1
 		next.LastDeferredAt = now
+		// FirstDeferredAt is set-once — symmetric with the send side
+		// (see RecordAsSent). The metrics doc could have been created
+		// on a prior send, so check the field rather than assuming.
+		if next.FirstDeferredAt.IsZero() {
+			next.FirstDeferredAt = now
+		}
 		if m.metrics.CompareAndSwap(key, prev, &next) {
 			break
 		}
@@ -266,16 +275,7 @@ func (m *Store) ReadMetrics(_ context.Context, key string) (sendstate.Metrics, b
 	if !ok {
 		return sendstate.Metrics{}, false, nil
 	}
-	met := *v.(*sendstate.Metrics)
-	// Hand back a copy of the map so callers can't mutate stored state.
-	if met.PeakSendsInWindow != nil {
-		cp := make(map[string]uint64, len(met.PeakSendsInWindow))
-		for k, n := range met.PeakSendsInWindow {
-			cp[k] = n
-		}
-		met.PeakSendsInWindow = cp
-	}
-	return met, true, nil
+	return *v.(*sendstate.Metrics), true, nil
 }
 
 // RangeDeferred visits pending entries (most recent deferral newer

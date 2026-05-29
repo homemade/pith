@@ -1,17 +1,17 @@
-package protect_test
+package core_test
 
 import (
 	"context"
 	"errors"
 	"testing"
 
-	"github.com/homemade/pith/protect"
+	"github.com/homemade/pith/internal/core"
 	"github.com/homemade/pith/sendstate"
 )
 
 // failingStore is a [sendstate.Store] stub that returns a configured
 // error from ReadEntry (and benign behavior from the rest). It's used
-// to exercise [protect.Protector.Check]'s fail-open contract — the
+// to exercise [core.Protector.Check]'s fail-open contract — the
 // other methods are inert so the test pins exactly the error path
 // under test.
 type failingStore struct {
@@ -42,17 +42,17 @@ func (f *failingStore) RangeDeferred(context.Context, int, func(string, sendstat
 // == DecisionProceed").
 func TestProtector_Check_FailsOpenOnReadEntryError(t *testing.T) {
 	wantErr := errors.New("simulated store outage")
-	p := protect.New(&failingStore{readErr: wantErr})
+	p := core.New(&failingStore{readErr: wantErr})
 
-	out := p.Check(context.Background(), protect.Request{
-		RequestMeta: protect.RequestMeta{TargetKey: "k1"},
+	out := p.Check(context.Background(), core.Request{
+		RequestMeta: core.RequestMeta{TargetKey: "k1"},
 		ContentHash: "h1",
 	})
 
 	if !errors.Is(out.Err, wantErr) {
 		t.Fatalf("Outcome.Err = %v, want to wrap %v", out.Err, wantErr)
 	}
-	if out.Decision != protect.DecisionProceed {
+	if out.Decision != core.DecisionProceed {
 		t.Fatalf("Outcome.Decision = %s, want DecisionProceed (fail-open)", out.Decision)
 	}
 	if out.Reason != "" {

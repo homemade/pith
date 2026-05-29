@@ -20,11 +20,6 @@
 //   - One read drives a Check: policies read only entries; metrics is
 //     observability-only.
 //
-// TODO(peaks): peak observability ([sendstate.Metrics.PeakSendsInWindow])
-// is intentionally not wired in the initial release — see the matching
-// note on [Store.RecordAsSent]. The metricsDoc still defines the BSON
-// field so a later wire-up reads any value present without a migration.
-//
 // Cross-instance correctness depends on the collections (or client)
 // using majority write concern, so a RecordAsSent is visible to the
 // next instance's ReadEntry; configure that on the *mongo.Database
@@ -74,21 +69,23 @@ func (d entryDoc) entry() sendstate.Entry {
 
 // metricsDoc is the metrics-collection document — the lifetime rollup.
 type metricsDoc struct {
-	Key               string            `bson:"_id"`
-	TotalSent         uint64            `bson:"totalSent"`
-	TotalDeferred     uint64            `bson:"totalDeferred"`
-	LastSentAt        time.Time         `bson:"lastSentAt,omitempty"`
-	LastDeferredAt    time.Time         `bson:"lastDeferredAt,omitempty"`
-	PeakSendsInWindow map[string]uint64 `bson:"peakSendsInWindow,omitempty"`
+	Key             string    `bson:"_id"`
+	TotalSent       uint64    `bson:"totalSent"`
+	TotalDeferred   uint64    `bson:"totalDeferred"`
+	FirstSentAt     time.Time `bson:"firstSentAt,omitempty"`
+	FirstDeferredAt time.Time `bson:"firstDeferredAt,omitempty"`
+	LastSentAt      time.Time `bson:"lastSentAt,omitempty"`
+	LastDeferredAt  time.Time `bson:"lastDeferredAt,omitempty"`
 }
 
 func (d metricsDoc) metrics() sendstate.Metrics {
 	return sendstate.Metrics{
-		TotalSent:         d.TotalSent,
-		TotalDeferred:     d.TotalDeferred,
-		LastSentAt:        d.LastSentAt,
-		LastDeferredAt:    d.LastDeferredAt,
-		PeakSendsInWindow: d.PeakSendsInWindow,
+		TotalSent:       d.TotalSent,
+		TotalDeferred:   d.TotalDeferred,
+		FirstSentAt:     d.FirstSentAt,
+		FirstDeferredAt: d.FirstDeferredAt,
+		LastSentAt:      d.LastSentAt,
+		LastDeferredAt:  d.LastDeferredAt,
 	}
 }
 
@@ -275,12 +272,6 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 // Two round-trips: entries update, then metrics update. Eventually
 // consistent across the two collections; only entries drives
 // decisions, so this never affects an answer.
-//
-// TODO(peaks): [sendstate.Metrics.PeakSendsInWindow] is intentionally
-// not populated in the initial release. The Store interface comment
-// describes the shape the recording methods will grow when we revisit;
-// the natural Mongo update is a $max-merge of peakSendsInWindow.<name>
-// alongside the $inc/$set already here.
 func (s *Store) RecordAsSent(ctx context.Context, key, contentHash string) error {
 	now := time.Now()
 
@@ -292,9 +283,14 @@ func (s *Store) RecordAsSent(ctx context.Context, key, contentHash string) error
 		return err
 	}
 
+	// $min sets firstSentAt on first write (field missing → $min stores
+	// the new value) and preserves it on subsequent writes (now is always
+	// >= the stored value, so the stored value wins). Encodes set-once
+	// semantics atomically with the rest of the metrics update.
 	_, err = s.metrics.UpdateByID(ctx, key, bson.M{
 		"$inc": bson.M{"totalSent": 1},
 		"$set": bson.M{"lastSentAt": now},
+		"$min": bson.M{"firstSentAt": now},
 	}, options.UpdateOne().SetUpsert(true))
 	return err
 }
@@ -303,8 +299,6 @@ func (s *Store) RecordAsSent(ctx context.Context, key, contentHash string) error
 // timestamp (and scalar lastDeferredAt tail), and refreshes the TTL —
 // without touching contentHash, lastNSendTimes, or lastSentAt; then
 // bumps the deferred-side counters.
-//
-// TODO(peaks): see the matching note on RecordAsSent.
 func (s *Store) RecordAsDeferred(ctx context.Context, key string, messageRef []byte) error {
 	now := time.Now()
 
@@ -316,9 +310,12 @@ func (s *Store) RecordAsDeferred(ctx context.Context, key string, messageRef []b
 		return err
 	}
 
+	// $min on firstDeferredAt — set-once semantics symmetric with
+	// firstSentAt on RecordAsSent. See that method's comment.
 	_, err = s.metrics.UpdateByID(ctx, key, bson.M{
 		"$inc": bson.M{"totalDeferred": 1},
 		"$set": bson.M{"lastDeferredAt": now},
+		"$min": bson.M{"firstDeferredAt": now},
 	}, options.UpdateOne().SetUpsert(true))
 	return err
 }

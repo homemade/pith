@@ -16,10 +16,8 @@
 //     [pith/coalesce.Coalescer] thresholds against) — so a single
 //     ReadEntry drives a whole [pith/protect.Protector.Check].
 //   - [Metrics] — lifetime observability rollup: TotalSent,
-//     TotalDeferred, LastSentAt, LastDeferredAt, and (when wired —
-//     see TODO(peaks) on [Metrics.PeakSendsInWindow]) per-cap
-//     PeakSendsInWindow high-water marks. Read via [Store.ReadMetrics].
-//     Never expires.
+//     TotalDeferred, LastSentAt, LastDeferredAt. Read via
+//     [Store.ReadMetrics]. Never expires.
 //
 // [Store.RecordAsSent] sets ContentHash, appends a timestamp to
 // LastNSendTimes, refreshes the Entry TTL, increments TotalSent and
@@ -207,6 +205,15 @@ func countInWindow(times []time.Time, now time.Time, window time.Duration) int {
 
 // Metrics is the lifetime observability rollup for a per-key record.
 // It never expires.
+//
+// Paired with the Total* counters, FirstSentAt / FirstDeferredAt
+// define an "activity span" for each side — useful for cheap
+// per-key averages like sends-per-day:
+//
+//	if !met.FirstSentAt.IsZero() && met.TotalSent > 1 {
+//	    span := met.LastSentAt.Sub(met.FirstSentAt)
+//	    rate := float64(met.TotalSent) / span.Hours()
+//	}
 type Metrics struct {
 	// TotalSent is the lifetime count of [Store.RecordAsSent] calls
 	// for this key.
@@ -215,6 +222,18 @@ type Metrics struct {
 	// TotalDeferred is the lifetime count of
 	// [Store.RecordAsDeferred] calls for this key.
 	TotalDeferred uint64
+
+	// FirstSentAt is the timestamp of the *first* [Store.RecordAsSent]
+	// ever observed for this key — set once and never updated. Zero
+	// when no send has been observed. With LastSentAt it defines the
+	// active-send window for this key.
+	FirstSentAt time.Time
+
+	// FirstDeferredAt is the timestamp of the *first*
+	// [Store.RecordAsDeferred] ever observed for this key — set once
+	// and never updated. Zero when no deferral has been observed.
+	// With LastDeferredAt it defines the active-deferral window.
+	FirstDeferredAt time.Time
 
 	// LastSentAt is the timestamp of the most recent
 	// [Store.RecordAsSent]. Zero when no send has been observed.
@@ -226,22 +245,6 @@ type Metrics struct {
 	// sends. Zero only if no deferral has ever been observed. A
 	// deferral is pending iff LastDeferredAt is after LastSentAt.
 	LastDeferredAt time.Time
-
-	// PeakSendsInWindow is the high-water mark of in-window send count
-	// per attached cap, keyed by the cap's derived name — what
-	// [pith/coalesce.Coalescer.CapPolicy] returns and what surfaces
-	// as Outcome.Reason on a defer (e.g. "leading-edge debounce 10s",
-	// "quota cap 50 per 24h", or a custom Coalescer's name). The
-	// value is the largest [Entry.CountSentInWindow] the cap's window
-	// has reached.
-	//
-	// TODO(peaks): not populated in the initial release — backends
-	// leave this nil. The Store interface comment describes the
-	// shape the recording methods will grow when we revisit. Map
-	// (not fixed fields) on purpose: caps are deployment config, so
-	// new ones come and go without a migration, mapping 1:1 to a
-	// BSON sub-document.
-	PeakSendsInWindow map[string]uint64
 }
 
 // Store is the shared per-key send-state store. [Store.ReadEntry]
@@ -249,14 +252,6 @@ type Metrics struct {
 // [Store.ReadMetrics] serves observability. Writes come from
 // [pith/protect.Protector.RecordAsSent] (on successful sends) and
 // [pith/protect.Protector.Check] (on Coalescer-driven deferrals).
-//
-// TODO(peaks): peak observability ([Metrics.PeakSendsInWindow]) is
-// intentionally NOT wired through Store in the initial release —
-// backends leave the field unset. When we revisit, the natural shape
-// is a peakBumps map[string]uint64 added to RecordAsSent and
-// RecordAsDeferred so the Store can max-merge per-cap bumps atomically
-// with the rest of the write; [pith/protect.Protector.Check] precomputes
-// the bumps from the Entry it already reads.
 type Store interface {
 	// RecordAsSent stores (key → contentHash) stamped at now, appends
 	// a timestamp to the key's LastNSendTimes, refreshes the Entry

@@ -215,6 +215,74 @@ func TestStore_RecordAsDeferred(t *testing.T) {
 	}
 }
 
+// FirstSentAt / FirstDeferredAt have set-once semantics, implemented
+// via Mongo's $min operator (writes new value if missing, otherwise
+// keeps the smaller — and since clock-monotonic now is always >= the
+// stored value, the stored one always wins on subsequent writes).
+// Mirrors the memory backend's test.
+func TestStore_FirstSentAtAndFirstDeferredAt(t *testing.T) {
+	s := newStore(t, time.Hour, WithMaxSendTimes(10))
+	ctx := context.Background()
+
+	// Send side.
+	_ = s.RecordAsSent(ctx, "k1", "h1")
+	met, _, _ := s.ReadMetrics(ctx, "k1")
+	first := met.FirstSentAt
+	if first.IsZero() {
+		t.Fatalf("FirstSentAt should be set after first send")
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	_ = s.RecordAsSent(ctx, "k1", "h2")
+	met, _, _ = s.ReadMetrics(ctx, "k1")
+	// Mongo stores timestamps at millisecond precision, so use ~Equal rather
+	// than strict equality after a round-trip.
+	if !met.FirstSentAt.Equal(first) {
+		t.Fatalf("FirstSentAt should be unchanged ($min preserves the smaller stored value), got %v want %v", met.FirstSentAt, first)
+	}
+	if !met.LastSentAt.After(first) {
+		t.Fatalf("LastSentAt should advance past FirstSentAt: first=%v last=%v", first, met.LastSentAt)
+	}
+
+	// Defer side.
+	_ = s.RecordAsDeferred(ctx, "k2", []byte("ref-1"))
+	met, _, _ = s.ReadMetrics(ctx, "k2")
+	firstD := met.FirstDeferredAt
+	if firstD.IsZero() {
+		t.Fatalf("FirstDeferredAt should be set after first deferral")
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	_ = s.RecordAsDeferred(ctx, "k2", []byte("ref-2"))
+	met, _, _ = s.ReadMetrics(ctx, "k2")
+	if !met.FirstDeferredAt.Equal(firstD) {
+		t.Fatalf("FirstDeferredAt should be unchanged on subsequent deferral, got %v want %v", met.FirstDeferredAt, firstD)
+	}
+
+	// Cross-side: deferral creates the metrics doc, then a send fires.
+	// FirstSentAt must reflect the send's timestamp (set via $min on a
+	// previously-missing field — the prior defer didn't write it).
+	_ = s.RecordAsDeferred(ctx, "k3", []byte("ref"))
+	met, _, _ = s.ReadMetrics(ctx, "k3")
+	deferAt := met.FirstDeferredAt
+	if !met.FirstSentAt.IsZero() {
+		t.Fatalf("FirstSentAt should be zero when only deferrals have been recorded, got %v", met.FirstSentAt)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	_ = s.RecordAsSent(ctx, "k3", "h")
+	met, _, _ = s.ReadMetrics(ctx, "k3")
+	if met.FirstSentAt.IsZero() {
+		t.Fatalf("FirstSentAt should be set after the first send")
+	}
+	if !met.FirstSentAt.After(deferAt) {
+		t.Fatalf("FirstSentAt should reflect the send's timestamp, not the metrics-doc creation moment: firstSent=%v deferAt=%v", met.FirstSentAt, deferAt)
+	}
+	if !met.FirstDeferredAt.Equal(deferAt) {
+		t.Fatalf("FirstDeferredAt must be preserved across a later send: got %v want %v", met.FirstDeferredAt, deferAt)
+	}
+}
+
 func TestStore_LastNSendTimesCap(t *testing.T) {
 	s := newStore(t, time.Hour, WithMaxSendTimes(3))
 	ctx := context.Background()
@@ -259,12 +327,6 @@ func TestStore_ReadEntryHonorsTTL(t *testing.T) {
 		t.Fatalf("Metrics should survive Entry TTL: ok=%v TotalSent=%d", ok, met.TotalSent)
 	}
 }
-
-// TODO(peaks): when [sendstate.Metrics.PeakSendsInWindow] is wired back
-// in (see the matching TODO on [sendstate.Store] / [Store.RecordAsSent]),
-// add a TestStore_PeakSendsInWindowOnRecord that exercises the $max-merge
-// folded into the recording calls. The earlier version was removed
-// alongside the peak observability code itself.
 
 func TestStore_RangeDeferred(t *testing.T) {
 	s := newStore(t, time.Hour)

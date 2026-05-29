@@ -141,6 +141,75 @@ func TestMemoryStore_RecordAsDeferred(t *testing.T) {
 	}
 }
 
+// FirstSentAt / FirstDeferredAt have set-once semantics: written on
+// the first observation, preserved on every subsequent write. Pins
+// each side independently and a cross-side sequence (defer-then-send
+// must populate both, with FirstSentAt taken from the send not the
+// metrics-doc-creation moment).
+func TestMemoryStore_FirstSentAtAndFirstDeferredAt(t *testing.T) {
+	s := New(testTTL)
+	ctx := context.Background()
+
+	// Send side: FirstSentAt set on first record, unchanged on second.
+	_ = s.RecordAsSent(ctx, "k1", "h1")
+	met, _, _ := s.ReadMetrics(ctx, "k1")
+	first := met.FirstSentAt
+	if first.IsZero() {
+		t.Fatalf("FirstSentAt should be set after first send")
+	}
+	if !met.FirstSentAt.Equal(met.LastSentAt) {
+		t.Fatalf("after first send FirstSentAt and LastSentAt should match: first=%v last=%v", met.FirstSentAt, met.LastSentAt)
+	}
+
+	time.Sleep(5 * time.Millisecond)
+	_ = s.RecordAsSent(ctx, "k1", "h2")
+	met, _, _ = s.ReadMetrics(ctx, "k1")
+	if !met.FirstSentAt.Equal(first) {
+		t.Fatalf("FirstSentAt should be unchanged on subsequent send, got %v want %v", met.FirstSentAt, first)
+	}
+	if !met.LastSentAt.After(first) {
+		t.Fatalf("LastSentAt should advance past FirstSentAt: first=%v last=%v", first, met.LastSentAt)
+	}
+
+	// Defer side: FirstDeferredAt set on first record, unchanged on second.
+	_ = s.RecordAsDeferred(ctx, "k2", []byte("ref-1"))
+	met, _, _ = s.ReadMetrics(ctx, "k2")
+	firstD := met.FirstDeferredAt
+	if firstD.IsZero() {
+		t.Fatalf("FirstDeferredAt should be set after first deferral")
+	}
+
+	time.Sleep(5 * time.Millisecond)
+	_ = s.RecordAsDeferred(ctx, "k2", []byte("ref-2"))
+	met, _, _ = s.ReadMetrics(ctx, "k2")
+	if !met.FirstDeferredAt.Equal(firstD) {
+		t.Fatalf("FirstDeferredAt should be unchanged on subsequent deferral, got %v want %v", met.FirstDeferredAt, firstD)
+	}
+
+	// Cross-side: defer creates the metrics doc, then a send happens.
+	// FirstSentAt must be set from the send (not the prior deferral),
+	// FirstDeferredAt must remain the deferral's timestamp.
+	_ = s.RecordAsDeferred(ctx, "k3", []byte("ref"))
+	met, _, _ = s.ReadMetrics(ctx, "k3")
+	deferAt := met.FirstDeferredAt
+	if !met.FirstSentAt.IsZero() {
+		t.Fatalf("FirstSentAt should be zero when only deferrals have been recorded, got %v", met.FirstSentAt)
+	}
+
+	time.Sleep(5 * time.Millisecond)
+	_ = s.RecordAsSent(ctx, "k3", "h")
+	met, _, _ = s.ReadMetrics(ctx, "k3")
+	if met.FirstSentAt.IsZero() {
+		t.Fatalf("FirstSentAt should be set after the first send (even when the metrics doc was already created by a prior defer)")
+	}
+	if !met.FirstSentAt.After(deferAt) {
+		t.Fatalf("FirstSentAt should reflect the send's timestamp, not the doc-creation moment: firstSent=%v deferAt=%v", met.FirstSentAt, deferAt)
+	}
+	if !met.FirstDeferredAt.Equal(deferAt) {
+		t.Fatalf("FirstDeferredAt must be preserved across a later send: got %v want %v", met.FirstDeferredAt, deferAt)
+	}
+}
+
 func TestEntry_CountDeferredInWindow(t *testing.T) {
 	s := New(testTTL)
 	ctx := context.Background()
@@ -303,12 +372,6 @@ func TestMemoryStore_SweepDeletesExpiredEntriesKeepsMetrics(t *testing.T) {
 		t.Fatalf("TotalSent should continue from retained metrics = 2, got %d", met.TotalSent)
 	}
 }
-
-// TODO(peaks): when [sendstate.Metrics.PeakSendsInWindow] is wired back
-// in (see the matching TODO on [sendstate.Store]), add a
-// TestMemoryStore_PeakSendsInWindowOnRecord that exercises the per-cap
-// max-merge folded into RecordAsSent and RecordAsDeferred. The earlier
-// version was removed alongside the peak observability code itself.
 
 func TestMemoryStore_RangeDeferred(t *testing.T) {
 	s := New(testTTL)

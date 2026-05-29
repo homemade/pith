@@ -1,4 +1,4 @@
-package protect_test
+package core_test
 
 import (
 	"context"
@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/homemade/pith/coalesce"
-	"github.com/homemade/pith/protect"
+	"github.com/homemade/pith/internal/core"
 	"github.com/homemade/pith/sendstate/memory"
 )
 
@@ -15,25 +15,25 @@ import (
 func TestProtector_ReplayCandidates(t *testing.T) {
 	ctx := context.Background()
 	const debounce = 30 * time.Millisecond
-	p := protect.New(
+	p := core.New(
 		memory.New(time.Hour),
-		protect.WithCoalescer(coalesce.NewLeadingEdgeDebounce(debounce)),
+		core.WithCoalescer(coalesce.NewLeadingEdgeDebounce(debounce)),
 	)
-	req := func(h string) protect.Request {
-		return protect.Request{
-			RequestMeta: protect.RequestMeta{TargetKey: "k1", MessageRef: []byte("ref")},
+	req := func(h string) core.Request {
+		return core.Request{
+			RequestMeta: core.RequestMeta{TargetKey: "k1", MessageRef: []byte("ref")},
 			ContentHash: h,
 		}
 	}
 
 	// First send proceeds and is recorded.
-	if out := p.Check(ctx, req("h1")); out.Decision != protect.DecisionProceed {
+	if out := p.Check(ctx, req("h1")); out.Decision != core.DecisionProceed {
 		t.Fatalf("first Check should proceed, got %s", out.Decision)
 	}
 	_ = p.RecordAsSent(ctx, req("h1"))
 
 	// Second (new content) within the window → debounce defers → pending.
-	if out := p.Check(ctx, req("h2")); out.Decision != protect.DecisionDeferred {
+	if out := p.Check(ctx, req("h2")); out.Decision != core.DecisionDeferred {
 		t.Fatalf("second Check should defer (debounce), got %s", out.Decision)
 	}
 
@@ -59,10 +59,3 @@ func TestProtector_ReplayCandidates(t *testing.T) {
 		t.Fatalf("expected breadcrumb on returned entry, got %q", metas[0].MessageRef)
 	}
 }
-
-// TODO(peaks): when [sendstate.Metrics.PeakSendsInWindow] is wired back
-// in (see the matching TODO on [protect.Protector.Check] / RecordAsSent),
-// add a TestProtector_PeakSendsInWindow that asserts each proceed and
-// each defer bumps the firing-cap's high-water mark to count+1 in the
-// metrics record. Removed from the initial release alongside the peak
-// observability code itself.

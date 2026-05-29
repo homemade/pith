@@ -1,4 +1,4 @@
-package protect_test
+package core_test
 
 import (
 	"context"
@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/homemade/pith/coalesce"
-	"github.com/homemade/pith/protect"
+	"github.com/homemade/pith/internal/core"
 	"github.com/homemade/pith/sendstate"
 	"github.com/homemade/pith/sendstate/memory"
 	"github.com/joineduptech/doc/sequencerec"
@@ -24,30 +24,30 @@ import (
 // policy — the diagram shows that as a single ReadEntry arrow followed
 // by pure-function policy arrows that don't go back to the store.
 
-// recordingProtector wraps a [protect.Protector] so the public calls a
+// recordingProtector wraps a [core.Protector] so the public calls a
 // client makes show up as the outermost Client->Protector arrows. Each
 // call is bracketed with Enter/Exit so the Protector's activation bar
 // spans the collaborator calls it makes inside.
 type recordingProtector struct {
-	inner *protect.Protector
+	inner *core.Protector
 	rec   *sequencerec.Recorder
 }
 
-func (w *recordingProtector) Check(ctx context.Context, req protect.Request) protect.Outcome {
+func (w *recordingProtector) Check(ctx context.Context, req core.Request) core.Outcome {
 	w.rec.Enter("Client", "Protector", "Check", nil)
 	out := w.inner.Check(ctx, req)
 	w.rec.Exit([]any{outcomeLabel(out)})
 	return out
 }
 
-func (w *recordingProtector) RecordAsSent(ctx context.Context, req protect.Request) error {
+func (w *recordingProtector) RecordAsSent(ctx context.Context, req core.Request) error {
 	w.rec.Enter("Client", "Protector", "RecordAsSent", nil)
 	err := w.inner.RecordAsSent(ctx, req)
 	w.rec.Exit([]any{err})
 	return err
 }
 
-func (w *recordingProtector) ReplayCandidates(ctx context.Context, limit int) ([]protect.DeferredRequest, error) {
+func (w *recordingProtector) ReplayCandidates(ctx context.Context, limit int) ([]core.DeferredRequest, error) {
 	w.rec.Enter("Client", "Protector", "ReplayCandidates", []any{limit})
 	ready, err := w.inner.ReplayCandidates(ctx, limit)
 	w.rec.Exit([]any{fmt.Sprintf("%d DeferredRequest", len(ready))})
@@ -57,7 +57,7 @@ func (w *recordingProtector) ReplayCandidates(ctx context.Context, limit int) ([
 // outcomeLabel renders a Check outcome as a single return value,
 // folding the deferral Reason in so the diagram shows which mechanism
 // fired without a separate arrow.
-func outcomeLabel(out protect.Outcome) string {
+func outcomeLabel(out core.Outcome) string {
 	if out.Reason != "" {
 		return fmt.Sprintf("%s (%s)", out.Decision, out.Reason)
 	}
@@ -147,7 +147,7 @@ func (r *recordingSendStore) RecordAsDeferred(ctx context.Context, key string, m
 	return err
 }
 
-// TestProtectorScenarios exercises each [protect.Protector.Check]
+// TestProtectorScenarios exercises each [core.Protector.Check]
 // decision branch and emits a Mermaid sequence diagram next to this
 // file (sequence_test.md).
 func TestProtectorScenarios(t *testing.T) {
@@ -208,12 +208,12 @@ func TestProtectorScenarios(t *testing.T) {
 	// Check outcome, not a separate participant. Wire debounce
 	// *before* quota so the diagram evaluates the short-window cap
 	// first (cheaper / source-driven check).
-	p := protect.New(
+	p := core.New(
 		recStore,
-		protect.WithCoalescer(
+		core.WithCoalescer(
 			&recordingCap{inner: innerDebounce, rec: rec, name: "Debounce"},
 		),
-		protect.WithCoalescer(
+		core.WithCoalescer(
 			&recordingCap{inner: innerQuota, rec: rec, name: "Quota"},
 		),
 	)
@@ -221,8 +221,8 @@ func TestProtectorScenarios(t *testing.T) {
 	pr := &recordingProtector{inner: p, rec: rec}
 
 	rec.Run(t, scenario1, func(t *testing.T) {
-		req := protect.Request{
-			RequestMeta: protect.RequestMeta{
+		req := core.Request{
+			RequestMeta: core.RequestMeta{
 				TargetKey:  "act-1:contact-1",
 				MessageRef: []byte("activity-A"),
 			},
@@ -233,7 +233,7 @@ func TestProtectorScenarios(t *testing.T) {
 		if out.Err != nil {
 			t.Fatalf("Check: %v", out.Err)
 		}
-		if out.Decision != protect.DecisionProceed {
+		if out.Decision != core.DecisionProceed {
 			t.Fatalf("want Proceed, got %s", out.Decision)
 		}
 		rec.Note(fmt.Sprintf("→ %s", out.Decision))
@@ -260,8 +260,8 @@ func TestProtectorScenarios(t *testing.T) {
 	})
 
 	rec.Run(t, "duplicate content to the same target is deduped", func(t *testing.T) {
-		req := protect.Request{
-			RequestMeta: protect.RequestMeta{
+		req := core.Request{
+			RequestMeta: core.RequestMeta{
 				TargetKey:  "act-1:contact-1", // same target as scenario 1
 				MessageRef: []byte("activity-A-dup"),
 			},
@@ -272,15 +272,15 @@ func TestProtectorScenarios(t *testing.T) {
 		if out.Err != nil {
 			t.Fatalf("Check: %v", out.Err)
 		}
-		if out.Decision != protect.DecisionDeduped {
+		if out.Decision != core.DecisionDeduped {
 			t.Fatalf("want Deduped, got %s", out.Decision)
 		}
 		rec.Note(fmt.Sprintf("→ %s (%s) — no breadcrumb stamped", out.Decision, out.Reason))
 	})
 
 	rec.Run(t, "same-target follow-up within debounce window is deferred", func(t *testing.T) {
-		req := protect.Request{
-			RequestMeta: protect.RequestMeta{
+		req := core.Request{
+			RequestMeta: core.RequestMeta{
 				TargetKey:  "act-1:contact-1", // same target as scenario 1
 				MessageRef: []byte("activity-B"),
 			},
@@ -291,7 +291,7 @@ func TestProtectorScenarios(t *testing.T) {
 		if out.Err != nil {
 			t.Fatalf("Check: %v", out.Err)
 		}
-		if out.Decision != protect.DecisionDeferred {
+		if out.Decision != core.DecisionDeferred {
 			t.Fatalf("want Deferred, got %s", out.Decision)
 		}
 		if want := "leading-edge debounce 30ms"; out.Reason != want {
@@ -311,8 +311,8 @@ func TestProtectorScenarios(t *testing.T) {
 		_ = innerStore.RecordAsSent(ctx, "act-1:contact-3", "setup-2")
 		time.Sleep(2 * debounceWindow)
 
-		req := protect.Request{
-			RequestMeta: protect.RequestMeta{
+		req := core.Request{
+			RequestMeta: core.RequestMeta{
 				TargetKey:  "act-1:contact-3",
 				MessageRef: []byte("activity-C"),
 			},
@@ -323,7 +323,7 @@ func TestProtectorScenarios(t *testing.T) {
 		if out.Err != nil {
 			t.Fatalf("Check: %v", out.Err)
 		}
-		if out.Decision != protect.DecisionDeferred {
+		if out.Decision != core.DecisionDeferred {
 			t.Fatalf("want Deferred, got %s", out.Decision)
 		}
 		if want := "quota cap 2 per 24h"; out.Reason != want {
@@ -333,8 +333,8 @@ func TestProtectorScenarios(t *testing.T) {
 	})
 
 	rec.Run(t, "below-cap send proceeds; RecordAsSent appends to sendstate", func(t *testing.T) {
-		req := protect.Request{
-			RequestMeta: protect.RequestMeta{
+		req := core.Request{
+			RequestMeta: core.RequestMeta{
 				TargetKey:  "act-1:contact-4",
 				MessageRef: []byte("activity-D"),
 			},
@@ -345,7 +345,7 @@ func TestProtectorScenarios(t *testing.T) {
 		if out.Err != nil {
 			t.Fatalf("Check: %v", out.Err)
 		}
-		if out.Decision != protect.DecisionProceed {
+		if out.Decision != core.DecisionProceed {
 			t.Fatalf("want Proceed, got %s", out.Decision)
 		}
 		rec.Note(fmt.Sprintf("→ %s", out.Decision))
