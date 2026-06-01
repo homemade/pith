@@ -100,6 +100,19 @@ func (m *Store) RecordAsSent(_ context.Context, key, contentHash string) error {
 	now := time.Now()
 	expireAt := now.Add(m.ttl)
 
+	// Peaks are only meaningful when more than one send time is retained
+	// (maxSendTimes > 1); at the dedupe-only floor of 1 the window count is a
+	// constant 1, so skip the fold and leave the peak fields unset. The cap
+	// rises above the floor only when a windowing policy is in use (see
+	// GrowMaxSendTimes), which is exactly when the peaks become meaningful.
+	//
+	// Rolling-window send counts at this send (when tracking) are captured as
+	// the Entry CAS commits below and folded into the peaks in the metrics
+	// loop. A trailing-window count peaks at an arrival, so sampling here is
+	// exact over the bounded send-time list.
+	trackPeaks := m.maxSendTimes() > 1
+	var sent1h, sent24h int
+
 	// Entry store.
 	for {
 		v, ok := m.entries.Load(key)
@@ -109,6 +122,9 @@ func (m *Store) RecordAsSent(_ context.Context, key, contentHash string) error {
 				expireAt: expireAt,
 			}
 			if _, loaded := m.entries.LoadOrStore(key, fresh); !loaded {
+				if trackPeaks {
+					sent1h, sent24h = 1, 1 // first send: in both windows
+				}
 				break
 			}
 			continue
@@ -135,6 +151,11 @@ func (m *Store) RecordAsSent(_ context.Context, key, contentHash string) error {
 			expireAt: expireAt,
 		}
 		if m.entries.CompareAndSwap(key, prev, next) {
+			if trackPeaks {
+				e := sendstate.Entry{LastNSendTimes: times}
+				sent1h = e.CountSentInWindow(now, time.Hour)
+				sent24h = e.CountSentInWindow(now, 24*time.Hour)
+			}
 			break
 		}
 	}
@@ -147,6 +168,10 @@ func (m *Store) RecordAsSent(_ context.Context, key, contentHash string) error {
 				TotalSent:   1,
 				FirstSentAt: now,
 				LastSentAt:  now,
+			}
+			if trackPeaks {
+				fresh.Peak1h, fresh.Peak1hAt = uint64(sent1h), now
+				fresh.Peak24h, fresh.Peak24hAt = uint64(sent24h), now
 			}
 			if _, loaded := m.metrics.LoadOrStore(key, fresh); !loaded {
 				break
@@ -166,6 +191,17 @@ func (m *Store) RecordAsSent(_ context.Context, key, contentHash string) error {
 		// the field itself rather than assuming "fresh doc means first".
 		if next.FirstSentAt.IsZero() {
 			next.FirstSentAt = now
+		}
+		// Peak high-water marks: strict > stamps PeakedAt only when the peak
+		// rises, marking the first time a level is reached (later ties don't
+		// move it). Lifetime — never decreased.
+		if trackPeaks {
+			if c := uint64(sent1h); c > next.Peak1h {
+				next.Peak1h, next.Peak1hAt = c, now
+			}
+			if c := uint64(sent24h); c > next.Peak24h {
+				next.Peak24h, next.Peak24hAt = c, now
+			}
 		}
 		if m.metrics.CompareAndSwap(key, prev, &next) {
 			break

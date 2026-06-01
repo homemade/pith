@@ -455,3 +455,94 @@ func TestMemoryStore_Concurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestMemoryStore_PeakHighWaterMarks: rapid sends all fall inside both
+// rolling windows, so each peak tracks the running send count, and the
+// first send seeds PeakedAt == LastSentAt.
+func TestMemoryStore_PeakHighWaterMarks(t *testing.T) {
+	s := New(testTTL)
+	ctx := context.Background()
+
+	// First send: peak is 1 in both windows, stamped at the send.
+	_ = s.RecordAsSent(ctx, "k1", "h")
+	met, _, _ := s.ReadMetrics(ctx, "k1")
+	if met.Peak1h != 1 || met.Peak24h != 1 {
+		t.Fatalf("after 1 send: Peak1h=%d Peak24h=%d, want 1/1", met.Peak1h, met.Peak24h)
+	}
+	if met.Peak1hAt.IsZero() || !met.Peak1hAt.Equal(met.LastSentAt) {
+		t.Fatalf("after 1 send: Peak1hAt=%v should equal LastSentAt=%v", met.Peak1hAt, met.LastSentAt)
+	}
+	if !met.Peak24hAt.Equal(met.LastSentAt) {
+		t.Fatalf("after 1 send: Peak24hAt=%v should equal LastSentAt=%v", met.Peak24hAt, met.LastSentAt)
+	}
+
+	// Four more rapid sends — all in window, so both peaks reach 5.
+	for range 4 {
+		_ = s.RecordAsSent(ctx, "k1", "h")
+	}
+	met, _, _ = s.ReadMetrics(ctx, "k1")
+	if met.TotalSent != 5 {
+		t.Fatalf("TotalSent=%d, want 5", met.TotalSent)
+	}
+	if met.Peak1h != 5 || met.Peak24h != 5 {
+		t.Fatalf("after 5 sends: Peak1h=%d Peak24h=%d, want 5/5", met.Peak1h, met.Peak24h)
+	}
+}
+
+// TestMemoryStore_PeakFreezesWhenWindowCountPlateaus is the distinguishing
+// test: with the send-time list capped, the in-window count plateaus, so
+// the peak stops rising and PeakedAt freezes at the last rise — diverging
+// from LastSentAt, which keeps advancing. This is the whole point of a
+// dedicated PeakedAt over reusing LastSentAt.
+func TestMemoryStore_PeakFreezesWhenWindowCountPlateaus(t *testing.T) {
+	s := New(testTTL)
+	s.MaxSendTimes = 3 // count saturates at 3
+	ctx := context.Background()
+
+	// 2ms gaps so timestamps stay strictly ordered (also after the
+	// millisecond truncation the Mongo mirror applies).
+	for range 6 {
+		_ = s.RecordAsSent(ctx, "k1", "h")
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	met, _, _ := s.ReadMetrics(ctx, "k1")
+	if met.TotalSent != 6 {
+		t.Fatalf("TotalSent=%d, want 6", met.TotalSent)
+	}
+	if met.Peak1h != 3 || met.Peak24h != 3 {
+		t.Fatalf("Peak1h=%d Peak24h=%d, want 3/3 (capped count)", met.Peak1h, met.Peak24h)
+	}
+	// PeakedAt froze at the 3rd send; LastSentAt is the 6th. They must differ.
+	if !met.Peak1hAt.Before(met.LastSentAt) {
+		t.Fatalf("Peak1hAt=%v should be before LastSentAt=%v (peak froze, sends continued)", met.Peak1hAt, met.LastSentAt)
+	}
+	// Both windows plateaued on the same send, so their PeakedAt agree.
+	if !met.Peak1hAt.Equal(met.Peak24hAt) {
+		t.Fatalf("Peak1hAt=%v and Peak24hAt=%v should match (same plateau send)", met.Peak1hAt, met.Peak24hAt)
+	}
+}
+
+// TestMemoryStore_PeaksSkippedAtDedupeFloor: at maxSendTimes == 1 the window
+// count is a constant 1, so peak tracking is skipped and the fields stay
+// unset — while the rest of the metrics still advance.
+func TestMemoryStore_PeaksSkippedAtDedupeFloor(t *testing.T) {
+	s := New(testTTL)
+	s.MaxSendTimes = 1 // dedupe-only floor
+	ctx := context.Background()
+
+	for range 5 {
+		_ = s.RecordAsSent(ctx, "k1", "h")
+	}
+
+	met, _, _ := s.ReadMetrics(ctx, "k1")
+	if met.TotalSent != 5 || met.LastSentAt.IsZero() {
+		t.Fatalf("non-peak metrics should still advance: TotalSent=%d LastSentAt=%v", met.TotalSent, met.LastSentAt)
+	}
+	if met.Peak1h != 0 || met.Peak24h != 0 {
+		t.Fatalf("Peak1h=%d Peak24h=%d, want 0/0 (skipped at floor)", met.Peak1h, met.Peak24h)
+	}
+	if !met.Peak1hAt.IsZero() || !met.Peak24hAt.IsZero() {
+		t.Fatalf("PeakedAt should be zero at floor, got %v / %v", met.Peak1hAt, met.Peak24hAt)
+	}
+}

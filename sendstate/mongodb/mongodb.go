@@ -76,6 +76,10 @@ type metricsDoc struct {
 	FirstDeferredAt time.Time `bson:"firstDeferredAt,omitempty"`
 	LastSentAt      time.Time `bson:"lastSentAt,omitempty"`
 	LastDeferredAt  time.Time `bson:"lastDeferredAt,omitempty"`
+	Peak1h          uint64    `bson:"peak1h,omitempty"`
+	Peak1hAt        time.Time `bson:"peak1hAt,omitempty"`
+	Peak24h         uint64    `bson:"peak24h,omitempty"`
+	Peak24hAt       time.Time `bson:"peak24hAt,omitempty"`
 }
 
 func (d metricsDoc) metrics() sendstate.Metrics {
@@ -86,6 +90,10 @@ func (d metricsDoc) metrics() sendstate.Metrics {
 		FirstDeferredAt: d.FirstDeferredAt,
 		LastSentAt:      d.LastSentAt,
 		LastDeferredAt:  d.LastDeferredAt,
+		Peak1h:          d.Peak1h,
+		Peak1hAt:        d.Peak1hAt,
+		Peak24h:         d.Peak24h,
+		Peak24hAt:       d.Peak24hAt,
 	}
 }
 
@@ -275,22 +283,76 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 func (s *Store) RecordAsSent(ctx context.Context, key, contentHash string) error {
 	now := time.Now()
 
-	_, err := s.entries.UpdateByID(ctx, key, bson.M{
+	// Dedupe-only floor: at maxSendTimes == 1 the send-time list holds a
+	// single element, so any rolling-window count is a constant 1 and the
+	// peak high-water marks convey nothing. Keep the cheap path — a plain
+	// UpdateByID entry write (no read-back) and classic-operator metrics (no
+	// pipeline) — and skip the peaks. maxSendTimes only rises above the floor
+	// when a windowing policy is in use (see GrowMaxSendTimes), which is
+	// exactly when the peaks become meaningful.
+	if s.maxSendTimes <= 1 {
+		_, err := s.entries.UpdateByID(ctx, key, bson.M{
+			"$set":  bson.M{"contentHash": contentHash, "lastSentAt": now, "expireAt": now.Add(s.ttl)},
+			"$push": bson.M{"lastNSendTimes": bson.M{"$each": bson.A{now}, "$slice": -s.maxSendTimes}},
+		}, options.UpdateOne().SetUpsert(true))
+		if err != nil {
+			return err
+		}
+		_, err = s.metrics.UpdateByID(ctx, key, bson.M{
+			"$inc": bson.M{"totalSent": 1},
+			"$set": bson.M{"lastSentAt": now},
+			"$min": bson.M{"firstSentAt": now},
+		}, options.UpdateOne().SetUpsert(true))
+		return err
+	}
+
+	// Windowed mode: FindOneAndUpdate (not UpdateByID) so we read back the
+	// post-$push, post-$slice send-time list to count the rolling windows
+	// below. Same write and round-trip — it just returns the document.
+	var doc entryDoc
+	err := s.entries.FindOneAndUpdate(ctx, bson.M{"_id": key}, bson.M{
 		"$set":  bson.M{"contentHash": contentHash, "lastSentAt": now, "expireAt": now.Add(s.ttl)},
 		"$push": bson.M{"lastNSendTimes": bson.M{"$each": bson.A{now}, "$slice": -s.maxSendTimes}},
-	}, options.UpdateOne().SetUpsert(true))
+	}, options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After)).Decode(&doc)
 	if err != nil {
 		return err
 	}
 
-	// $min sets firstSentAt on first write (field missing → $min stores
-	// the new value) and preserves it on subsequent writes (now is always
-	// >= the stored value, so the stored value wins). Encodes set-once
-	// semantics atomically with the rest of the metrics update.
-	_, err = s.metrics.UpdateByID(ctx, key, bson.M{
-		"$inc": bson.M{"totalSent": 1},
-		"$set": bson.M{"lastSentAt": now},
-		"$min": bson.M{"firstSentAt": now},
+	// Peak high-water marks: the count is taken at this send (always at an
+	// arrival, where a trailing-window count peaks), so the running maximum
+	// over all sends is the exact rolling-window peak. int64 avoids uint64
+	// BSON encoding quirks and decodes cleanly into the uint64 doc fields.
+	ent := doc.entry()
+	sent1h := int64(ent.CountSentInWindow(now, time.Hour))
+	sent24h := int64(ent.CountSentInWindow(now, 24*time.Hour))
+
+	// A pipeline update (one $set stage) rather than classic operators: a
+	// bare $max can fold the peak magnitude but cannot also stamp the
+	// peak…At timestamp conditionally — that needs $cond, which only exists
+	// in aggregation expressions and can't be mixed with $inc/$set/$min. All
+	// expressions in the stage read the pre-stage document, so each peak…At
+	// compares the incoming count against the *previously stored* peak.
+	//   - $add/$ifNull reproduces the old $inc on totalSent.
+	//   - $min on firstSentAt keeps set-once semantics (missing field → now;
+	//     otherwise the earlier stored value wins).
+	//   - strict $gt stamps peak…At only when the peak rises, so it marks the
+	//     first time a level is reached and is not moved by later ties.
+	_, err = s.metrics.UpdateByID(ctx, key, mongo.Pipeline{
+		{{Key: "$set", Value: bson.M{
+			"totalSent":   bson.M{"$add": bson.A{bson.M{"$ifNull": bson.A{"$totalSent", 0}}, 1}},
+			"lastSentAt":  now,
+			"firstSentAt": bson.M{"$min": bson.A{"$firstSentAt", now}},
+			"peak1h":      bson.M{"$max": bson.A{bson.M{"$ifNull": bson.A{"$peak1h", 0}}, sent1h}},
+			"peak1hAt": bson.M{"$cond": bson.A{
+				bson.M{"$gt": bson.A{sent1h, bson.M{"$ifNull": bson.A{"$peak1h", 0}}}},
+				now, "$peak1hAt",
+			}},
+			"peak24h": bson.M{"$max": bson.A{bson.M{"$ifNull": bson.A{"$peak24h", 0}}, sent24h}},
+			"peak24hAt": bson.M{"$cond": bson.A{
+				bson.M{"$gt": bson.A{sent24h, bson.M{"$ifNull": bson.A{"$peak24h", 0}}}},
+				now, "$peak24hAt",
+			}},
+		}}},
 	}, options.UpdateOne().SetUpsert(true))
 	return err
 }

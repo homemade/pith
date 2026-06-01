@@ -478,3 +478,92 @@ func TestOpen_RequiresPositiveEntryTTL(t *testing.T) {
 		t.Fatalf("err = %v, want an EntryTTL-required error", err)
 	}
 }
+
+// TestStore_PeakHighWaterMarks mirrors the memory backend: rapid sends all
+// fall inside both rolling windows, so each peak tracks the running count
+// and the first send seeds PeakedAt == LastSentAt. Exercises the $set
+// pipeline ($max magnitude + $cond-on-rise PeakedAt) against real Mongo.
+func TestStore_PeakHighWaterMarks(t *testing.T) {
+	// Default maxSendTimes is the dedupe-only floor of 1; production sizes
+	// it to the largest Coalescer cap via protect. Set a realistic cap so
+	// the in-window count can exceed 1.
+	s := newStore(t, time.Hour, WithMaxSendTimes(50))
+	ctx := context.Background()
+
+	_ = s.RecordAsSent(ctx, "k1", "h")
+	met, _, _ := s.ReadMetrics(ctx, "k1")
+	if met.Peak1h != 1 || met.Peak24h != 1 {
+		t.Fatalf("after 1 send: Peak1h=%d Peak24h=%d, want 1/1", met.Peak1h, met.Peak24h)
+	}
+	if met.Peak1hAt.IsZero() || !met.Peak1hAt.Equal(met.LastSentAt) {
+		t.Fatalf("after 1 send: Peak1hAt=%v should equal LastSentAt=%v", met.Peak1hAt, met.LastSentAt)
+	}
+	if !met.Peak24hAt.Equal(met.LastSentAt) {
+		t.Fatalf("after 1 send: Peak24hAt=%v should equal LastSentAt=%v", met.Peak24hAt, met.LastSentAt)
+	}
+
+	for range 4 {
+		_ = s.RecordAsSent(ctx, "k1", "h")
+	}
+	met, _, _ = s.ReadMetrics(ctx, "k1")
+	if met.TotalSent != 5 {
+		t.Fatalf("TotalSent=%d, want 5", met.TotalSent)
+	}
+	if met.Peak1h != 5 || met.Peak24h != 5 {
+		t.Fatalf("after 5 sends: Peak1h=%d Peak24h=%d, want 5/5", met.Peak1h, met.Peak24h)
+	}
+}
+
+// TestStore_PeakFreezesWhenWindowCountPlateaus mirrors the memory backend's
+// distinguishing test: with lastNSendTimes $slice-capped, the in-window
+// count plateaus, so the peak stops rising and PeakedAt freezes at the last
+// rise — diverging from LastSentAt. Verifies the strict $gt in the pipeline.
+func TestStore_PeakFreezesWhenWindowCountPlateaus(t *testing.T) {
+	s := newStore(t, time.Hour, WithMaxSendTimes(3))
+	ctx := context.Background()
+
+	// 2ms gaps keep timestamps strictly ordered after BSON's millisecond
+	// truncation.
+	for range 6 {
+		_ = s.RecordAsSent(ctx, "k1", "h")
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	met, _, _ := s.ReadMetrics(ctx, "k1")
+	if met.TotalSent != 6 {
+		t.Fatalf("TotalSent=%d, want 6", met.TotalSent)
+	}
+	if met.Peak1h != 3 || met.Peak24h != 3 {
+		t.Fatalf("Peak1h=%d Peak24h=%d, want 3/3 (capped count)", met.Peak1h, met.Peak24h)
+	}
+	if !met.Peak1hAt.Before(met.LastSentAt) {
+		t.Fatalf("Peak1hAt=%v should be before LastSentAt=%v (peak froze, sends continued)", met.Peak1hAt, met.LastSentAt)
+	}
+	if !met.Peak1hAt.Equal(met.Peak24hAt) {
+		t.Fatalf("Peak1hAt=%v and Peak24hAt=%v should match (same plateau send)", met.Peak1hAt, met.Peak24hAt)
+	}
+}
+
+// TestStore_PeaksSkippedAtDedupeFloor: the default maxSendTimes is the
+// dedupe-only floor of 1, so RecordAsSent takes the cheap path (plain
+// UpdateByID + classic-operator metrics, no read-back, no pipeline) and
+// leaves the peak fields unset — while the rest of the metrics still advance.
+func TestStore_PeaksSkippedAtDedupeFloor(t *testing.T) {
+	s := newStore(t, time.Hour) // no WithMaxSendTimes → floor of 1
+	ctx := context.Background()
+
+	for range 5 {
+		_ = s.RecordAsSent(ctx, "k1", "h")
+	}
+
+	met, _, _ := s.ReadMetrics(ctx, "k1")
+	if met.TotalSent != 5 || met.LastSentAt.IsZero() {
+		t.Fatalf("non-peak metrics should still advance: TotalSent=%d LastSentAt=%v", met.TotalSent, met.LastSentAt)
+	}
+	if met.Peak1h != 0 || met.Peak24h != 0 {
+		t.Fatalf("Peak1h=%d Peak24h=%d, want 0/0 (skipped at floor)", met.Peak1h, met.Peak24h)
+	}
+	if !met.Peak1hAt.IsZero() || !met.Peak24hAt.IsZero() {
+		t.Fatalf("PeakedAt should be zero at floor, got %v / %v", met.Peak1hAt, met.Peak24hAt)
+	}
+}

@@ -245,6 +245,35 @@ type Metrics struct {
 	// sends. Zero only if no deferral has ever been observed. A
 	// deferral is pending iff LastDeferredAt is after LastSentAt.
 	LastDeferredAt time.Time
+
+	// Peak1h is the high-water mark of sends within any rolling 1-hour
+	// window for this key: the maximum [Entry.CountSentInWindow] over a 1h
+	// window observed at a [Store.RecordAsSent]. Monotonic — only ever
+	// rises, and never cleared, so it survives the expiry of the underlying
+	// send timestamps. Zero when no send has been observed.
+	//
+	// Accuracy bound: the count is taken over the bounded send-time list, so
+	// Peak1h is exact only while that list retains a full window of sends;
+	// if the cap is smaller than the busiest window it observes, Peak1h is a
+	// lower bound.
+	Peak1h uint64
+
+	// Peak1hAt is when Peak1h was first reached — the [Store.RecordAsSent]
+	// timestamp whose 1h window count first exceeded the prior peak (stamped
+	// on a strict increase, so it marks the first time the level was hit and
+	// is not moved by later ties). Distinct from LastSentAt whenever the
+	// peak predates the most recent send. Zero when no send has been
+	// observed.
+	Peak1hAt time.Time
+
+	// Peak24h is the high-water mark of sends within any rolling 24-hour
+	// window — the 24h analogue of Peak1h, with the same monotonicity and
+	// accuracy bound.
+	Peak24h uint64
+
+	// Peak24hAt is when Peak24h was first reached — the 24h analogue of
+	// Peak1hAt.
+	Peak24hAt time.Time
 }
 
 // Store is the shared per-key send-state store. [Store.ReadEntry]
