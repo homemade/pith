@@ -106,11 +106,19 @@ func (m *Store) RecordAsSent(_ context.Context, key, contentHash string) error {
 	// rises above the floor only when a windowing policy is in use (see
 	// GrowMaxSendTimes), which is exactly when the peaks become meaningful.
 	//
+	// A window's peak is also folded ONLY when EntryTTL covers it: below that
+	// the entry expires after a gap shorter than the window, so the count is a
+	// misleading lower bound that silently resets (e.g. a 2h-TTL store folds
+	// peak1h but skips peak24h). Skipped fields stay unset — absent, not a
+	// deceptive 0.
+	//
 	// Rolling-window send counts at this send (when tracking) are captured as
 	// the Entry CAS commits below and folded into the peaks in the metrics
 	// loop. A trailing-window count peaks at an arrival, so sampling here is
 	// exact over the bounded send-time list.
-	trackPeaks := m.maxSendTimes() > 1
+	fold1h := m.maxSendTimes() > 1 && m.ttl >= time.Hour
+	fold24h := m.maxSendTimes() > 1 && m.ttl >= 24*time.Hour
+	trackPeaks := fold1h || fold24h
 	var sent1h, sent24h int
 
 	// Entry store.
@@ -133,7 +141,9 @@ func (m *Store) RecordAsSent(_ context.Context, key, contentHash string) error {
 		// Copy-on-write the slice so any prior reader's Entry stays
 		// immutable, then bound it to the most recent maxSendTimes().
 		// Carrying forward an expired record's stale timestamps is
-		// harmless: the TTL > any window, so they never count.
+		// harmless: a window is only folded when TTL >= that window, so
+		// timestamps from a record older than the TTL fall outside every
+		// folded window and never count.
 		times := append(append([]time.Time(nil), prev.entry.LastNSendTimes...), now)
 		if n := m.maxSendTimes(); len(times) > n {
 			times = append([]time.Time(nil), times[len(times)-n:]...)
@@ -169,8 +179,10 @@ func (m *Store) RecordAsSent(_ context.Context, key, contentHash string) error {
 				FirstSentAt: now,
 				LastSentAt:  now,
 			}
-			if trackPeaks {
+			if fold1h {
 				fresh.Peak1h, fresh.Peak1hAt = uint64(sent1h), now
+			}
+			if fold24h {
 				fresh.Peak24h, fresh.Peak24hAt = uint64(sent24h), now
 			}
 			if _, loaded := m.metrics.LoadOrStore(key, fresh); !loaded {
@@ -195,10 +207,12 @@ func (m *Store) RecordAsSent(_ context.Context, key, contentHash string) error {
 		// Peak high-water marks: strict > stamps PeakedAt only when the peak
 		// rises, marking the first time a level is reached (later ties don't
 		// move it). Lifetime — never decreased.
-		if trackPeaks {
+		if fold1h {
 			if c := uint64(sent1h); c > next.Peak1h {
 				next.Peak1h, next.Peak1hAt = c, now
 			}
+		}
+		if fold24h {
 			if c := uint64(sent24h); c > next.Peak24h {
 				next.Peak24h, next.Peak24hAt = c, now
 			}

@@ -486,8 +486,9 @@ func TestOpen_RequiresPositiveEntryTTL(t *testing.T) {
 func TestStore_PeakHighWaterMarks(t *testing.T) {
 	// Default maxSendTimes is the dedupe-only floor of 1; production sizes
 	// it to the largest Coalescer cap via protect. Set a realistic cap so
-	// the in-window count can exceed 1.
-	s := newStore(t, time.Hour, WithMaxSendTimes(50))
+	// the in-window count can exceed 1. TTL exceeds the 24h window so both
+	// peaks fold (see RecordAsSent's TTL>=window guard).
+	s := newStore(t, 25*time.Hour, WithMaxSendTimes(50))
 	ctx := context.Background()
 
 	_ = s.RecordAsSent(ctx, "k1", "h")
@@ -519,7 +520,7 @@ func TestStore_PeakHighWaterMarks(t *testing.T) {
 // count plateaus, so the peak stops rising and PeakedAt freezes at the last
 // rise — diverging from LastSentAt. Verifies the strict $gt in the pipeline.
 func TestStore_PeakFreezesWhenWindowCountPlateaus(t *testing.T) {
-	s := newStore(t, time.Hour, WithMaxSendTimes(3))
+	s := newStore(t, 25*time.Hour, WithMaxSendTimes(3)) // TTL > 24h so both peaks fold
 	ctx := context.Background()
 
 	// 2ms gaps keep timestamps strictly ordered after BSON's millisecond
@@ -565,5 +566,30 @@ func TestStore_PeaksSkippedAtDedupeFloor(t *testing.T) {
 	}
 	if !met.Peak1hAt.IsZero() || !met.Peak24hAt.IsZero() {
 		t.Fatalf("PeakedAt should be zero at floor, got %v / %v", met.Peak1hAt, met.Peak24hAt)
+	}
+}
+
+// TestStore_PeakSkippedWhenTTLBelowWindow mirrors the memory backend: a
+// window's peak is only folded when EntryTTL covers it. A 2h-TTL store (the
+// Raisely write-back gate) retains under 24h of send history, so the $set
+// pipeline omits peak24h/peak24hAt entirely — they stay unset (absent, not a
+// deceptive 0) — while peak1h still folds because TTL >= 1h.
+func TestStore_PeakSkippedWhenTTLBelowWindow(t *testing.T) {
+	s := newStore(t, 2*time.Hour, WithMaxSendTimes(5)) // covers 1h, not 24h
+	ctx := context.Background()
+
+	for range 3 {
+		_ = s.RecordAsSent(ctx, "k1", "h")
+	}
+
+	met, _, _ := s.ReadMetrics(ctx, "k1")
+	if met.TotalSent != 3 {
+		t.Fatalf("TotalSent=%d, want 3", met.TotalSent)
+	}
+	if met.Peak1h != 3 || met.Peak1hAt.IsZero() {
+		t.Fatalf("Peak1h should fold (TTL >= 1h): Peak1h=%d Peak1hAt=%v", met.Peak1h, met.Peak1hAt)
+	}
+	if met.Peak24h != 0 || !met.Peak24hAt.IsZero() {
+		t.Fatalf("Peak24h must be unset (TTL < 24h): Peak24h=%d Peak24hAt=%v", met.Peak24h, met.Peak24hAt)
 	}
 }

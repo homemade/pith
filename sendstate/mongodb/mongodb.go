@@ -323,8 +323,17 @@ func (s *Store) RecordAsSent(ctx context.Context, key, contentHash string) error
 	// over all sends is the exact rolling-window peak. int64 avoids uint64
 	// BSON encoding quirks and decodes cleanly into the uint64 doc fields.
 	ent := doc.entry()
-	sent1h := int64(ent.CountSentInWindow(now, time.Hour))
-	sent24h := int64(ent.CountSentInWindow(now, 24*time.Hour))
+	// A window's peak is folded ONLY when EntryTTL covers it. Below that the
+	// trailing count is a misleading lower bound — the entry expires after a
+	// gap shorter than the window, so the "peak" silently resets on ordinary
+	// idle periods. The field is then left unset (omitempty → absent), which a
+	// reader can tell apart from a real 0. (E.g. a 2h-TTL store folds peak1h
+	// but skips peak24h.)
+	set := bson.M{
+		"totalSent":   bson.M{"$add": bson.A{bson.M{"$ifNull": bson.A{"$totalSent", 0}}, 1}},
+		"lastSentAt":  now,
+		"firstSentAt": bson.M{"$min": bson.A{"$firstSentAt", now}},
+	}
 
 	// A pipeline update (one $set stage) rather than classic operators: a
 	// bare $max can fold the peak magnitude but cannot also stamp the
@@ -337,23 +346,24 @@ func (s *Store) RecordAsSent(ctx context.Context, key, contentHash string) error
 	//     otherwise the earlier stored value wins).
 	//   - strict $gt stamps peak…At only when the peak rises, so it marks the
 	//     first time a level is reached and is not moved by later ties.
-	_, err = s.metrics.UpdateByID(ctx, key, mongo.Pipeline{
-		{{Key: "$set", Value: bson.M{
-			"totalSent":   bson.M{"$add": bson.A{bson.M{"$ifNull": bson.A{"$totalSent", 0}}, 1}},
-			"lastSentAt":  now,
-			"firstSentAt": bson.M{"$min": bson.A{"$firstSentAt", now}},
-			"peak1h":      bson.M{"$max": bson.A{bson.M{"$ifNull": bson.A{"$peak1h", 0}}, sent1h}},
-			"peak1hAt": bson.M{"$cond": bson.A{
-				bson.M{"$gt": bson.A{sent1h, bson.M{"$ifNull": bson.A{"$peak1h", 0}}}},
-				now, "$peak1hAt",
-			}},
-			"peak24h": bson.M{"$max": bson.A{bson.M{"$ifNull": bson.A{"$peak24h", 0}}, sent24h}},
-			"peak24hAt": bson.M{"$cond": bson.A{
-				bson.M{"$gt": bson.A{sent24h, bson.M{"$ifNull": bson.A{"$peak24h", 0}}}},
-				now, "$peak24hAt",
-			}},
-		}}},
-	}, options.UpdateOne().SetUpsert(true))
+	if s.ttl >= time.Hour {
+		sent1h := int64(ent.CountSentInWindow(now, time.Hour))
+		set["peak1h"] = bson.M{"$max": bson.A{bson.M{"$ifNull": bson.A{"$peak1h", 0}}, sent1h}}
+		set["peak1hAt"] = bson.M{"$cond": bson.A{
+			bson.M{"$gt": bson.A{sent1h, bson.M{"$ifNull": bson.A{"$peak1h", 0}}}},
+			now, "$peak1hAt",
+		}}
+	}
+	if s.ttl >= 24*time.Hour {
+		sent24h := int64(ent.CountSentInWindow(now, 24*time.Hour))
+		set["peak24h"] = bson.M{"$max": bson.A{bson.M{"$ifNull": bson.A{"$peak24h", 0}}, sent24h}}
+		set["peak24hAt"] = bson.M{"$cond": bson.A{
+			bson.M{"$gt": bson.A{sent24h, bson.M{"$ifNull": bson.A{"$peak24h", 0}}}},
+			now, "$peak24hAt",
+		}}
+	}
+
+	_, err = s.metrics.UpdateByID(ctx, key, mongo.Pipeline{{{Key: "$set", Value: set}}}, options.UpdateOne().SetUpsert(true))
 	return err
 }
 

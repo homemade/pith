@@ -11,8 +11,10 @@ import (
 )
 
 // testTTL is generously larger than any window/sleep used in these
-// tests, so entries don't expire mid-test unless deliberately backdated.
-const testTTL = time.Hour
+// tests (including the 24h peak window, so both Peak1h and Peak24h fold —
+// see RecordAsSent's TTL>=window guard), so entries don't expire mid-test
+// unless deliberately backdated.
+const testTTL = 25 * time.Hour
 
 func TestMemoryStore_RecordAsSentThenRead(t *testing.T) {
 	s := New(testTTL)
@@ -544,5 +546,32 @@ func TestMemoryStore_PeaksSkippedAtDedupeFloor(t *testing.T) {
 	}
 	if !met.Peak1hAt.IsZero() || !met.Peak24hAt.IsZero() {
 		t.Fatalf("PeakedAt should be zero at floor, got %v / %v", met.Peak1hAt, met.Peak24hAt)
+	}
+}
+
+// TestMemoryStore_PeakSkippedWhenTTLBelowWindow: a window's peak is only
+// folded when the Entry TTL covers it. A 2h-TTL store (e.g. the Raisely
+// write-back gate) retains less than 24h of send history, so Peak24h would
+// be a misleading lower bound that silently resets on idle gaps — it must
+// stay unset (absent, distinguishable from a real 0), while Peak1h still
+// folds because TTL >= 1h.
+func TestMemoryStore_PeakSkippedWhenTTLBelowWindow(t *testing.T) {
+	s := New(2 * time.Hour) // covers the 1h window, not the 24h one
+	s.MaxSendTimes = 5      // above the dedupe floor, so peaks are eligible
+	ctx := context.Background()
+
+	for range 3 {
+		_ = s.RecordAsSent(ctx, "k1", "h")
+	}
+
+	met, _, _ := s.ReadMetrics(ctx, "k1")
+	if met.TotalSent != 3 {
+		t.Fatalf("TotalSent=%d, want 3", met.TotalSent)
+	}
+	if met.Peak1h != 3 || met.Peak1hAt.IsZero() {
+		t.Fatalf("Peak1h should fold (TTL >= 1h): Peak1h=%d Peak1hAt=%v", met.Peak1h, met.Peak1hAt)
+	}
+	if met.Peak24h != 0 || !met.Peak24hAt.IsZero() {
+		t.Fatalf("Peak24h must be unset (TTL < 24h): Peak24h=%d Peak24hAt=%v", met.Peak24h, met.Peak24hAt)
 	}
 }

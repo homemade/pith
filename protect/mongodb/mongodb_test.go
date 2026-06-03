@@ -80,8 +80,8 @@ func TestNew_ErrorsOnMaxSendTimesBelowDerived(t *testing.T) {
 	_, _, err := pmongo.New(context.Background(), pmongo.Config{
 		URI:          "mongodb://ignored",
 		Database:     "ignored",
-		EntryTTL:     time.Hour,
-		MaxSendTimes: 10, // below the quota's hardCap of 50
+		EntryTTL:     25 * time.Hour, // covers the 24h Quota window so the below-derived check (not the TTL guard) is what fires
+		MaxSendTimes: 10,             // below the quota's hardCap of 50
 	}, protect.WithCoalescer(coalesce.NewQuota(50, 24*time.Hour)))
 	if err == nil {
 		t.Fatalf("expected an error when MaxSendTimes < largest hardCap, got nil")
@@ -132,7 +132,7 @@ func TestNew_AutoDerivesMaxSendTimesFromCoalescers(t *testing.T) {
 	p, client, err := pmongo.New(ctx, pmongo.Config{
 		URI:      testURI,
 		Database: dbName,
-		EntryTTL: time.Hour,
+		EntryTTL: 25 * time.Hour, // must cover the 24h Quota window (core.New validates this)
 		Timeout:  200 * time.Millisecond,
 		// MaxSendTimes deliberately omitted — wrapper should derive it
 		// from the attached caps' largest hardCap (50).
@@ -181,7 +181,7 @@ func TestNew_RespectsExplicitMaxSendTimesAboveDerived(t *testing.T) {
 	p, client, err := pmongo.New(ctx, pmongo.Config{
 		URI:          testURI,
 		Database:     dbName,
-		EntryTTL:     time.Hour,
+		EntryTTL:     25 * time.Hour, // covers the 24h Quota window (core.New validates this)
 		Timeout:      200 * time.Millisecond,
 		MaxSendTimes: 200, // > derived (50) — should be respected.
 	}, protect.WithCoalescer(coalesce.NewQuota(50, 24*time.Hour)))
