@@ -10,35 +10,30 @@ import (
 	"github.com/homemade/pith/sendstate/memory"
 )
 
-// ReplayCandidates skips a pending entry while its cap window is
-// still open, then returns it once the window elapses.
-func TestProtector_ReplayCandidates(t *testing.T) {
+// ReplayCandidates skips a pending entry while its cap window is still
+// open, then returns it once the window elapses.
+func TestWriteGate_ReplayCandidates(t *testing.T) {
 	ctx := context.Background()
 	const debounce = 30 * time.Millisecond
-	p := core.New(
+	w := core.NewWrite(
 		memory.New(time.Hour),
-		core.WithCoalescer(coalesce.NewLeadingEdgeDebounce(debounce)),
+		coalesce.NewLeadingEdgeDebounce(debounce),
 	)
-	req := func(h string) core.Request {
-		return core.Request{
-			RequestMeta: core.RequestMeta{TargetKey: "k1", MessageRef: []byte("ref")},
-			ContentHash: h,
-		}
-	}
+	meta := core.RequestMeta{TargetKey: "k1", MessageRef: []byte("ref")}
 
 	// First send proceeds and is recorded.
-	if out := p.Check(ctx, req("h1")); out.Decision != core.DecisionProceed {
+	if out := w.Check(ctx, meta, "h1"); out.Decision != core.DecisionProceed {
 		t.Fatalf("first Check should proceed, got %s", out.Decision)
 	}
-	_ = p.RecordAsSent(ctx, req("h1"))
+	_ = w.RecordAsSent(ctx, meta, "h1")
 
 	// Second (new content) within the window → debounce defers → pending.
-	if out := p.Check(ctx, req("h2")); out.Decision != core.DecisionDeferred {
+	if out := w.Check(ctx, meta, "h2"); out.Decision != core.DecisionDeferred {
 		t.Fatalf("second Check should defer (debounce), got %s", out.Decision)
 	}
 
 	// Within the window: caps not clear → not returned.
-	metas, err := p.ReplayCandidates(ctx, 0)
+	metas, err := w.ReplayCandidates(ctx, 0)
 	if err != nil {
 		t.Fatalf("ReplayCandidates: %v", err)
 	}
@@ -48,7 +43,7 @@ func TestProtector_ReplayCandidates(t *testing.T) {
 
 	// After the window elapses: caps clear → returned.
 	time.Sleep(2 * debounce)
-	metas, err = p.ReplayCandidates(ctx, 0)
+	metas, err = w.ReplayCandidates(ctx, 0)
 	if err != nil {
 		t.Fatalf("ReplayCandidates: %v", err)
 	}

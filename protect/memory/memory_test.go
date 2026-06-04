@@ -10,60 +10,61 @@ import (
 	memprotect "github.com/homemade/pith/protect/memory"
 )
 
-// The factory is a thin wrapper, but pinning the happy path here keeps
-// it observable: a refactor that broke the wiring (e.g. forgot to apply
-// opts) would surface a Check that returns the wrong Decision.
-func TestNew_BuildsAFunctioningProtector(t *testing.T) {
+// The factories are thin wrappers, but pinning the happy paths here keeps
+// the wiring observable: a refactor that broke it would surface a Check
+// returning the wrong Decision.
+
+// A write protector dedupes identical content and defers a same-target
+// follow-up within the debounce window.
+func TestNewWriteProtector(t *testing.T) {
 	const debounce = 30 * time.Millisecond
-	p := memprotect.New(
+	p := memprotect.NewWriteProtector(
 		time.Hour,
-		protect.WithCoalescer(coalesce.NewLeadingEdgeDebounce(debounce)),
+		coalesce.NewLeadingEdgeDebounce(debounce),
 	)
 	ctx := context.Background()
+	meta := protect.RequestMeta{TargetKey: "k1"}
 
 	// First Check proceeds (no prior send).
-	req := protect.Request{
-		RequestMeta: protect.RequestMeta{TargetKey: "k1"},
-		ContentHash: "h1",
-	}
-	if out := p.Check(ctx, req); out.Decision != protect.DecisionProceed {
+	if out := p.Check(ctx, meta, "h1"); out.Decision != protect.DecisionProceed {
 		t.Fatalf("first Check = %s, want Proceed", out.Decision)
 	}
-	if err := p.RecordAsSent(ctx, req); err != nil {
-		t.Fatalf("RecordAsSent: %v", err)
-	}
-
-	// Second Check (different content) within the window → debounce defers.
-	req2 := protect.Request{
-		RequestMeta: protect.RequestMeta{TargetKey: "k1"},
-		ContentHash: "h2",
-	}
-	if out := p.Check(ctx, req2); out.Decision != protect.DecisionDeferred {
-		t.Fatalf("second Check = %s, want Deferred (debounce)", out.Decision)
-	}
-}
-
-// Memory-backed Protector works fine with no Coalescers attached —
-// dedupe-only behaviour, useful for tests and local dev. Pins this
-// because protect.New is happy with zero opts; the wrapper must
-// faithfully pass that through.
-func TestNew_DedupeOnlyWithoutCoalescers(t *testing.T) {
-	p := memprotect.New(time.Hour)
-	ctx := context.Background()
-
-	req := protect.Request{
-		RequestMeta: protect.RequestMeta{TargetKey: "k1"},
-		ContentHash: "h1",
-	}
-	if out := p.Check(ctx, req); out.Decision != protect.DecisionProceed {
-		t.Fatalf("Check = %s, want Proceed", out.Decision)
-	}
-	if err := p.RecordAsSent(ctx, req); err != nil {
+	if err := p.RecordAsSent(ctx, meta, "h1"); err != nil {
 		t.Fatalf("RecordAsSent: %v", err)
 	}
 
 	// Identical content → dedupe suppresses.
-	if out := p.Check(ctx, req); out.Decision != protect.DecisionDeduped {
+	if out := p.Check(ctx, meta, "h1"); out.Decision != protect.DecisionDeduped {
 		t.Fatalf("repeat Check = %s, want Deduped", out.Decision)
+	}
+
+	// New content within the window → debounce defers.
+	if out := p.Check(ctx, meta, "h2"); out.Decision != protect.DecisionDeferred {
+		t.Fatalf("new-content Check = %s, want Deferred (debounce)", out.Decision)
+	}
+}
+
+// A read protector has no dedupe and DROPS (not defers) a too-frequent
+// read — and takes no contentHash.
+func TestNewReadProtector(t *testing.T) {
+	const debounce = 30 * time.Millisecond
+	p := memprotect.NewReadProtector(
+		time.Hour,
+		coalesce.NewLeadingEdgeDebounce(debounce),
+	)
+	ctx := context.Background()
+	meta := protect.RequestMeta{TargetKey: "k1"}
+
+	// First Check proceeds.
+	if out := p.Check(ctx, meta); out.Decision != protect.DecisionProceed {
+		t.Fatalf("first Check = %s, want Proceed", out.Decision)
+	}
+	if err := p.RecordAsSent(ctx, meta); err != nil {
+		t.Fatalf("RecordAsSent: %v", err)
+	}
+
+	// Within the window → dropped (a read is skippable, not replayable).
+	if out := p.Check(ctx, meta); out.Decision != protect.DecisionDropped {
+		t.Fatalf("repeat Check = %s, want Dropped", out.Decision)
 	}
 }

@@ -1,15 +1,19 @@
-// Package mongodb wires a [pith/protect.Protector] to the Atlas-backed
+// Package mongodb wires a [pith/protect.ReadProtector] /
+// [pith/protect.WriteProtector] to the Atlas-backed
 // [pith/sendstate/mongodb.Store] backend, handling the MaxSendTimes
 // contract automatically.
 //
 // Without this wrapper, callers would need to remember to pass
 // Config.MaxSendTimes >= the largest attached Coalescer hardCap when
 // constructing the mongo store; the storage layer otherwise drops
-// in-window send timestamps via $slice and the cap leaks silently
-// (the contract pith/sendstate/mongodb godoc on WithMaxSendTimes flags
-// as the caller's responsibility). This package's New closes
-// that gap by deriving the value from the Coalescers attached via
-// opts — the same opts that drive Check's policy evaluation.
+// in-window send timestamps via $slice and the cap leaks silently (the
+// contract pith/sendstate/mongodb godoc on WithMaxSendTimes flags as the
+// caller's responsibility). These constructors close that gap by
+// deriving the value from the attached Coalescers — the same ones that
+// drive Check's policy evaluation.
+//
+// Both constructors require at least one Coalescer (the (first, rest...)
+// shape).
 package mongodb
 
 import (
@@ -18,6 +22,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
+	"github.com/homemade/pith/coalesce"
 	"github.com/homemade/pith/internal/core"
 	"github.com/homemade/pith/protect"
 	mongostore "github.com/homemade/pith/sendstate/mongodb"
@@ -27,52 +32,54 @@ import (
 // need a separate import. Identical shape and semantics.
 type Config = mongostore.Config
 
-// New returns a Protector backed by an Atlas-backed mongo
-// store, plus the underlying *mongo.Client (so callers can Disconnect
-// at shutdown), or an error.
+// NewReadProtector returns a [pith/protect.ReadProtector] backed by an
+// Atlas mongo store (coalesce caps only, capped Checks DROP), plus the
+// underlying *mongo.Client (so callers can Disconnect at shutdown), or an
+// error. MaxSendTimes is handled as described on [NewWriteProtector].
+func NewReadProtector(ctx context.Context, cfg Config, first coalesce.Coalescer, rest ...coalesce.Coalescer) (protect.ReadProtector, *mongo.Client, error) {
+	coalescers := append([]coalesce.Coalescer{first}, rest...)
+	store, client, err := open(ctx, cfg, coalescers)
+	if err != nil {
+		return nil, client, err
+	}
+	return core.NewRead(store, coalescers...), client, nil
+}
+
+// NewWriteProtector returns a [pith/protect.WriteProtector] backed by an
+// Atlas mongo store (content dedupe + coalesce caps, capped Checks DEFER),
+// plus the underlying *mongo.Client, or an error.
 //
-// MaxSendTimes handling — the reason this wrapper exists:
+// MaxSendTimes handling — the reason these wrappers exist:
 //
-//   - cfg.MaxSendTimes == 0: derived from the largest hardCap among
-//     Coalescers attached via opts. The common case: caller doesn't
-//     set MaxSendTimes at all and the wrapper sizes correctly.
-//   - cfg.MaxSendTimes >= derived: respected — a caller wanting
-//     extra headroom (e.g. for replay-bounded scans) can set a larger
-//     value explicitly.
-//   - cfg.MaxSendTimes < derived: returns an error. A smaller bound
-//     would silently leak the cap, so we surface the misconfiguration
-//     at construction instead of letting it manifest as overshooting
-//     quota in production.
+//   - cfg.MaxSendTimes == 0: derived from the largest hardCap among the
+//     attached Coalescers. The common case.
+//   - cfg.MaxSendTimes >= derived: respected — a caller wanting extra
+//     headroom (e.g. for replay-bounded scans) can set a larger value.
+//   - cfg.MaxSendTimes < derived: returns an error. A smaller bound would
+//     silently leak the cap via $slice, so we surface the misconfiguration
+//     at construction.
 //
 // All other Config fields (URI, Database, EntryTTL, Timeout) follow
 // [pith/sendstate/mongodb.Open]'s semantics — see its godoc.
-func New(ctx context.Context, cfg Config, opts ...protect.Option) (*protect.Protector, *mongo.Client, error) {
-	derived := largestHardCap(opts)
+func NewWriteProtector(ctx context.Context, cfg Config, first coalesce.Coalescer, rest ...coalesce.Coalescer) (protect.WriteProtector, *mongo.Client, error) {
+	coalescers := append([]coalesce.Coalescer{first}, rest...)
+	store, client, err := open(ctx, cfg, coalescers)
+	if err != nil {
+		return nil, client, err
+	}
+	return core.NewWrite(store, coalescers...), client, nil
+}
+
+// open sizes MaxSendTimes from the coalescers and opens the store. On
+// EnsureIndexes failure mongostore.Open returns a non-nil client so the
+// caller can Disconnect; that client is surfaced here too.
+func open(ctx context.Context, cfg Config, coalescers []coalesce.Coalescer) (*mongostore.Store, *mongo.Client, error) {
+	derived := core.LargestHardCap(coalescers...)
 	switch {
 	case cfg.MaxSendTimes == 0:
 		cfg.MaxSendTimes = derived
 	case cfg.MaxSendTimes < derived:
-		return nil, nil, fmt.Errorf("mongodb.New: Config.MaxSendTimes (%d) is below the largest attached Coalescer hardCap (%d) — would silently leak the cap via $slice", cfg.MaxSendTimes, derived)
+		return nil, nil, fmt.Errorf("mongodb: Config.MaxSendTimes (%d) is below the largest attached Coalescer hardCap (%d) — would silently leak the cap via $slice", cfg.MaxSendTimes, derived)
 	}
-	store, client, err := mongostore.Open(ctx, cfg)
-	if err != nil {
-		// On EnsureIndexes failure mongostore.Open returns a non-nil
-		// client so the caller can Disconnect; surface that here too.
-		return nil, client, err
-	}
-	return core.New(store, opts...), client, nil
-}
-
-// largestHardCap returns the largest hardCap among the Coalescers
-// attached via opts, or 0 when no Coalescers are attached. Uses
-// core.Inspect to avoid constructing a throwaway Protector.
-func largestHardCap(opts []protect.Option) int {
-	largest := 0
-	for _, c := range core.Inspect(opts...) {
-		_, hardCap, _ := c.CapPolicy()
-		if hardCap > largest {
-			largest = hardCap
-		}
-	}
-	return largest
+	return mongostore.Open(ctx, cfg)
 }

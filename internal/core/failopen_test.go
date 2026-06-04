@@ -4,16 +4,17 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
+	"github.com/homemade/pith/coalesce"
 	"github.com/homemade/pith/internal/core"
 	"github.com/homemade/pith/sendstate"
 )
 
 // failingStore is a [sendstate.Store] stub that returns a configured
 // error from ReadEntry (and benign behavior from the rest). It's used
-// to exercise [core.Protector.Check]'s fail-open contract — the
-// other methods are inert so the test pins exactly the error path
-// under test.
+// to exercise the gate's Check fail-open contract — the other methods
+// are inert so the test pins exactly the error path under test.
 type failingStore struct {
 	readErr error
 }
@@ -40,14 +41,11 @@ func (f *failingStore) RangeDeferred(context.Context, int, func(string, sendstat
 // The contract is documented at the top of protect.go ("Backing-store
 // errors are fail-open: a non-nil error from Check carries Decision
 // == DecisionProceed").
-func TestProtector_Check_FailsOpenOnReadEntryError(t *testing.T) {
+func TestGate_Check_FailsOpenOnReadEntryError(t *testing.T) {
 	wantErr := errors.New("simulated store outage")
-	p := core.New(&failingStore{readErr: wantErr})
+	w := core.NewWrite(&failingStore{readErr: wantErr}, coalesce.NewQuota(1, time.Hour))
 
-	out := p.Check(context.Background(), core.Request{
-		RequestMeta: core.RequestMeta{TargetKey: "k1"},
-		ContentHash: "h1",
-	})
+	out := w.Check(context.Background(), core.RequestMeta{TargetKey: "k1"}, "h1")
 
 	if !errors.Is(out.Err, wantErr) {
 		t.Fatalf("Outcome.Err = %v, want to wrap %v", out.Err, wantErr)

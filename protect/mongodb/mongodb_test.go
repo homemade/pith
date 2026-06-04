@@ -21,8 +21,8 @@ import (
 	pmongo "github.com/homemade/pith/protect/mongodb"
 )
 
-// Mirrors pith/sendstate/mongodb's container-per-package pattern so this
-// thin wrapper gets honest end-to-end coverage rather than mocking
+// Mirrors pith/sendstate/mongodb's container-per-package pattern so these
+// thin wrappers get honest end-to-end coverage rather than mocking
 // around the very behaviour we're trying to verify.
 var (
 	testURI   string
@@ -76,13 +76,13 @@ func freshDBName() string {
 // without a container so this test runs everywhere. Surfaces the
 // misconfiguration at construction instead of letting a too-small
 // MaxSendTimes silently leak the cap in production.
-func TestNew_ErrorsOnMaxSendTimesBelowDerived(t *testing.T) {
-	_, _, err := pmongo.New(context.Background(), pmongo.Config{
+func TestNewWriteProtector_ErrorsOnMaxSendTimesBelowDerived(t *testing.T) {
+	_, _, err := pmongo.NewWriteProtector(context.Background(), pmongo.Config{
 		URI:          "mongodb://ignored",
 		Database:     "ignored",
 		EntryTTL:     25 * time.Hour, // covers the 24h Quota window so the below-derived check (not the TTL guard) is what fires
 		MaxSendTimes: 10,             // below the quota's hardCap of 50
-	}, protect.WithCoalescer(coalesce.NewQuota(50, 24*time.Hour)))
+	}, coalesce.NewQuota(50, 24*time.Hour))
 	if err == nil {
 		t.Fatalf("expected an error when MaxSendTimes < largest hardCap, got nil")
 	}
@@ -93,55 +93,29 @@ func TestNew_ErrorsOnMaxSendTimesBelowDerived(t *testing.T) {
 	}
 }
 
-// No Coalescers attached → derived value is 0 → the wrapper doesn't
-// touch Config.MaxSendTimes → the underlying mongostore.New default
-// (dedupe-only floor of 1) applies. Pure-logic test, no Mongo needed
-// to exercise the validation path (Open is reached only if the
-// validation passes; here we deliberately don't reach Open by passing
-// a URI that would fail).
-func TestNew_ErrorsOnly_NoCoalescers_RespectsExplicitMaxSendTimes(t *testing.T) {
-	// With no Coalescers, derived = 0. cfg.MaxSendTimes = 1 is >= 0 so
-	// validation passes; Open then fails on the bad URI (which is fine —
-	// we just want to confirm we get *past* the wrapper's validation).
-	_, _, err := pmongo.New(context.Background(), pmongo.Config{
-		URI:          "mongodb://nonexistent.invalid:27017",
-		Database:     "ignored",
-		EntryTTL:     time.Hour,
-		MaxSendTimes: 1,
-		Timeout:      50 * time.Millisecond, // fail Open fast
-	})
-	if err == nil {
-		t.Fatalf("expected an Open error against the invalid host, got nil")
-	}
-	// Must NOT be our wrapper's "below derived" error.
-	if strings.Contains(err.Error(), "would silently leak") {
-		t.Fatalf("error came from the wrapper's validation, not Open: %v", err)
-	}
-}
-
 // Happy path: cfg.MaxSendTimes unset, the wrapper derives it from the
-// attached Coalescers, the resulting Protector is functional.
+// attached Coalescers, the resulting WriteProtector is functional.
 // Exercises the actual derivation logic against a real mongo backend.
-func TestNew_AutoDerivesMaxSendTimesFromCoalescers(t *testing.T) {
+func TestNewWriteProtector_AutoDerivesMaxSendTimesFromCoalescers(t *testing.T) {
 	if testURI == "" {
 		t.Skip("no MongoDB container (Docker unavailable)")
 	}
 	ctx := context.Background()
 	dbName := freshDBName()
 
-	p, client, err := pmongo.New(ctx, pmongo.Config{
+	p, client, err := pmongo.NewWriteProtector(ctx, pmongo.Config{
 		URI:      testURI,
 		Database: dbName,
-		EntryTTL: 25 * time.Hour, // must cover the 24h Quota window (core.New validates this)
+		EntryTTL: 25 * time.Hour, // must cover the 24h Quota window (core validates this)
 		Timeout:  200 * time.Millisecond,
 		// MaxSendTimes deliberately omitted — wrapper should derive it
 		// from the attached caps' largest hardCap (50).
 	},
-		protect.WithCoalescer(coalesce.NewLeadingEdgeDebounce(10*time.Second)),
-		protect.WithCoalescer(coalesce.NewQuota(50, 24*time.Hour)),
+		coalesce.NewLeadingEdgeDebounce(10*time.Second),
+		coalesce.NewQuota(50, 24*time.Hour),
 	)
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("NewWriteProtector: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = client.Database(dbName).Drop(context.Background())
@@ -149,53 +123,82 @@ func TestNew_AutoDerivesMaxSendTimesFromCoalescers(t *testing.T) {
 	})
 
 	// Functional check: a Check + RecordAsSent round-trip works.
-	req := protect.Request{
-		RequestMeta: protect.RequestMeta{TargetKey: "k1"},
-		ContentHash: "h1",
-	}
-	if out := p.Check(ctx, req); out.Decision != protect.DecisionProceed || out.Err != nil {
+	meta := protect.RequestMeta{TargetKey: "k1"}
+	if out := p.Check(ctx, meta, "h1"); out.Decision != protect.DecisionProceed || out.Err != nil {
 		t.Fatalf("first Check = %s, err=%v; want Proceed", out.Decision, out.Err)
 	}
-	if err := p.RecordAsSent(ctx, req); err != nil {
+	if err := p.RecordAsSent(ctx, meta, "h1"); err != nil {
 		t.Fatalf("RecordAsSent: %v", err)
 	}
 
-	// Identical content → dedupe trips. Confirms the protector and
-	// store are wired up end-to-end (a misconfigured MaxSendTimes
-	// wouldn't surface here, but a broken construction would).
-	if out := p.Check(ctx, req); out.Decision != protect.DecisionDeduped {
+	// Identical content → dedupe trips. Confirms the protector and store
+	// are wired up end-to-end.
+	if out := p.Check(ctx, meta, "h1"); out.Decision != protect.DecisionDeduped {
 		t.Fatalf("repeat Check = %s, want Deduped", out.Decision)
 	}
 }
 
-// Explicit MaxSendTimes override above the derived value is respected
-// — a caller wanting extra headroom (e.g. for future replay-bounded
-// scans) can set it without the wrapper second-guessing.
-func TestNew_RespectsExplicitMaxSendTimesAboveDerived(t *testing.T) {
+// A read protector built against a real mongo backend has no dedupe and
+// DROPS a capped read.
+func TestNewReadProtector_DropsAtCap(t *testing.T) {
 	if testURI == "" {
 		t.Skip("no MongoDB container (Docker unavailable)")
 	}
 	ctx := context.Background()
 	dbName := freshDBName()
 
-	p, client, err := pmongo.New(ctx, pmongo.Config{
-		URI:          testURI,
-		Database:     dbName,
-		EntryTTL:     25 * time.Hour, // covers the 24h Quota window (core.New validates this)
-		Timeout:      200 * time.Millisecond,
-		MaxSendTimes: 200, // > derived (50) — should be respected.
-	}, protect.WithCoalescer(coalesce.NewQuota(50, 24*time.Hour)))
+	r, client, err := pmongo.NewReadProtector(ctx, pmongo.Config{
+		URI:      testURI,
+		Database: dbName,
+		EntryTTL: 25 * time.Hour,
+		Timeout:  200 * time.Millisecond,
+	}, coalesce.NewQuota(1, 24*time.Hour))
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("NewReadProtector: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = client.Database(dbName).Drop(context.Background())
 		_ = client.Disconnect(context.Background())
 	})
-	// Just confirming construction succeeded — the override behaviour
-	// is "use what the caller said, don't error." A functional probe is
-	// covered by the auto-derive test.
+
+	meta := protect.RequestMeta{TargetKey: "r1"}
+	if out := r.Check(ctx, meta); out.Decision != protect.DecisionProceed || out.Err != nil {
+		t.Fatalf("first Check = %s, err=%v; want Proceed", out.Decision, out.Err)
+	}
+	if err := r.RecordAsSent(ctx, meta); err != nil {
+		t.Fatalf("RecordAsSent: %v", err)
+	}
+	// Quota of 1 is now reached → the next read is DROPPED (not deferred).
+	if out := r.Check(ctx, meta); out.Decision != protect.DecisionDropped {
+		t.Fatalf("over-cap Check = %s, want Dropped", out.Decision)
+	}
+}
+
+// Explicit MaxSendTimes override above the derived value is respected
+// — a caller wanting extra headroom (e.g. for future replay-bounded
+// scans) can set it without the wrapper second-guessing.
+func TestNewWriteProtector_RespectsExplicitMaxSendTimesAboveDerived(t *testing.T) {
+	if testURI == "" {
+		t.Skip("no MongoDB container (Docker unavailable)")
+	}
+	ctx := context.Background()
+	dbName := freshDBName()
+
+	p, client, err := pmongo.NewWriteProtector(ctx, pmongo.Config{
+		URI:          testURI,
+		Database:     dbName,
+		EntryTTL:     25 * time.Hour, // covers the 24h Quota window (core validates this)
+		Timeout:      200 * time.Millisecond,
+		MaxSendTimes: 200, // > derived (50) — should be respected.
+	}, coalesce.NewQuota(50, 24*time.Hour))
+	if err != nil {
+		t.Fatalf("NewWriteProtector: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = client.Database(dbName).Drop(context.Background())
+		_ = client.Disconnect(context.Background())
+	})
 	if p == nil {
-		t.Fatalf("New returned a nil Protector with no error")
+		t.Fatalf("NewWriteProtector returned a nil WriteProtector with no error")
 	}
 }

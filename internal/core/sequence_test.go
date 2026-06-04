@@ -15,34 +15,34 @@ import (
 )
 
 // The diagram is recorded at two levels. A Client lifeline drives the
-// Protector through its public surface (New / Check / RecordAsSent /
-// ReplayCandidates), recorded by recordingProtector. The Protector
-// in turn drives its collaborators (Store, Debounce, Quota),
-// recorded by the wrappers below — every one of their arrows has
-// source "Protector", so they nest inside the Protector's activation
-// bar. Protector.Check fetches one Entry up-front and feeds it to every
-// policy — the diagram shows that as a single ReadEntry arrow followed
-// by pure-function policy arrows that don't go back to the store.
+// WriteGate through its public surface (NewWrite / Check / RecordAsSent /
+// ReplayCandidates), recorded by recordingProtector. The gate in turn
+// drives its collaborators (Store, Debounce, Quota), recorded by the
+// wrappers below — every one of their arrows has source "Protector", so
+// they nest inside the gate's activation bar. Check fetches one Entry
+// up-front and feeds it to every policy — the diagram shows that as a
+// single ReadEntry arrow followed by pure-function policy arrows that
+// don't go back to the store.
 
-// recordingProtector wraps a [core.Protector] so the public calls a
+// recordingProtector wraps a [core.WriteGate] so the public calls a
 // client makes show up as the outermost Client->Protector arrows. Each
-// call is bracketed with Enter/Exit so the Protector's activation bar
-// spans the collaborator calls it makes inside.
+// call is bracketed with Enter/Exit so the gate's activation bar spans
+// the collaborator calls it makes inside.
 type recordingProtector struct {
-	inner *core.Protector
+	inner core.WriteGate
 	rec   *sequencerec.Recorder
 }
 
-func (w *recordingProtector) Check(ctx context.Context, req core.Request) core.Outcome {
+func (w *recordingProtector) Check(ctx context.Context, meta core.RequestMeta, contentHash string) core.Outcome {
 	w.rec.Enter("Client", "Protector", "Check", nil)
-	out := w.inner.Check(ctx, req)
+	out := w.inner.Check(ctx, meta, contentHash)
 	w.rec.Exit([]any{outcomeLabel(out)})
 	return out
 }
 
-func (w *recordingProtector) RecordAsSent(ctx context.Context, req core.Request) error {
+func (w *recordingProtector) RecordAsSent(ctx context.Context, meta core.RequestMeta, contentHash string) error {
 	w.rec.Enter("Client", "Protector", "RecordAsSent", nil)
-	err := w.inner.RecordAsSent(ctx, req)
+	err := w.inner.RecordAsSent(ctx, meta, contentHash)
 	w.rec.Exit([]any{err})
 	return err
 }
@@ -85,7 +85,7 @@ func (r *recordingCap) CapPolicy() (name string, hardCap int, window time.Durati
 }
 
 // recordingSendStore wraps a [sendstate.Store] so the read + write
-// surface the Protector uses surfaces in the diagram as Protector->Store
+// surface the gate uses surfaces in the diagram as Protector->Store
 // arrows. ReadEntry is recorded explicitly — it's the single read per
 // Check that drives every downstream policy.
 type recordingSendStore struct {
@@ -93,7 +93,7 @@ type recordingSendStore struct {
 	rec   *sequencerec.Recorder
 
 	// capsClear, when set, lets RangeDeferred annotate each swept
-	// entry with the replay verdict Protector.capsClear reaches for
+	// entry with the replay verdict the gate's capsClear reaches for
 	// it. It mirrors that check using the *unwrapped* coalescers, so
 	// the annotation doesn't emit a second round of ShouldDefer
 	// arrows on top of the ones the real sweep already records.
@@ -121,7 +121,7 @@ func (r *recordingSendStore) RangeDeferred(ctx context.Context, limit int, fn fu
 	r.rec.Enter("Protector", "Store", "RangeDeferred", []any{limit})
 	err := r.inner.RangeDeferred(ctx, limit, func(key string, e sendstate.Entry) bool {
 		r.rec.NoteOver("Protector", fmt.Sprintf("examine %s", key))
-		keep := fn(key, e) // runs Protector.capsClear → records the ShouldDefer arrows
+		keep := fn(key, e) // runs the gate's capsClear → records the ShouldDefer arrows
 		if r.capsClear != nil {
 			if r.capsClear(e) {
 				r.rec.NoteOver("Protector", "caps clear → replay candidate")
@@ -147,10 +147,10 @@ func (r *recordingSendStore) RecordAsDeferred(ctx context.Context, key string, m
 	return err
 }
 
-// TestProtectorScenarios exercises each [core.Protector.Check]
-// decision branch and emits a Mermaid sequence diagram next to this
-// file (sequence_test.md).
-func TestProtectorScenarios(t *testing.T) {
+// TestWriteGateScenarios exercises each [core.WriteGate] Check decision
+// branch and emits a Mermaid sequence diagram next to this file
+// (sequence_test.md).
+func TestWriteGateScenarios(t *testing.T) {
 	rec := sequencerec.New()
 	rec.SetActor("Client")
 	ctx := context.Background()
@@ -164,7 +164,7 @@ func TestProtectorScenarios(t *testing.T) {
 
 	// Track the observed interfaces so a method added to either surface
 	// fails this test until a scenario exercises it (or it's allowlisted
-	// in AssertCovered below). The facade *Protector is deliberately not
+	// in AssertCovered below). The facade WriteGate is deliberately not
 	// tracked — the diagram documents a chosen subset of its surface.
 	rec.Track("Store", reflect.TypeOf((*sendstate.Store)(nil)).Elem())
 	rec.Track("Debounce", reflect.TypeOf((*coalesce.Coalescer)(nil)).Elem())
@@ -182,7 +182,7 @@ func TestProtectorScenarios(t *testing.T) {
 	innerDebounce := coalesce.NewLeadingEdgeDebounce(debounceWindow)
 	innerQuota := coalesce.NewQuota(hardCap, capWindow)
 
-	// Quiet mirror of Protector.capsClear over the unwrapped
+	// Quiet mirror of the gate's capsClear over the unwrapped
 	// coalescers — used only by the replay-sweep scenario to label
 	// each swept entry's verdict without doubling its ShouldDefer
 	// arrows in the diagram.
@@ -193,43 +193,34 @@ func TestProtectorScenarios(t *testing.T) {
 
 	// Fold construction into the first scenario's diagram section so
 	// the wiring shows once, ahead of the first Check. SetScope tags
-	// the New() arrow with the same name the first rec.Run uses, so
+	// the NewWrite() arrow with the same name the first rec.Run uses, so
 	// they render together.
 	const scenario1 = "first send proceeds and is recorded"
 	rec.SetScope(scenario1)
-	rec.Enter("Client", "Protector", "New", []any{
+	rec.Enter("Client", "Protector", "NewWrite", []any{
 		"store",
-		"WithCoalescer(Debounce 1/30ms)",
-		"WithCoalescer(Quota 2/24h)",
+		"Debounce 1/30ms",
+		"Quota 2/24h",
 	})
 
-	// Content dedupe is always applied via sendstate.Entry.Seen
+	// Content dedupe is applied (write gate) via sendstate.Entry.Seen
 	// (no Coalescer to wrap), so it shows in the diagram only as the
 	// Check outcome, not a separate participant. Wire debounce
 	// *before* quota so the diagram evaluates the short-window cap
 	// first (cheaper / source-driven check).
-	p := core.New(
+	p := core.NewWrite(
 		recStore,
-		core.WithCoalescer(
-			&recordingCap{inner: innerDebounce, rec: rec, name: "Debounce"},
-		),
-		core.WithCoalescer(
-			&recordingCap{inner: innerQuota, rec: rec, name: "Quota"},
-		),
+		&recordingCap{inner: innerDebounce, rec: rec, name: "Debounce"},
+		&recordingCap{inner: innerQuota, rec: rec, name: "Quota"},
 	)
-	rec.Exit([]any{"*Protector"})
+	rec.Exit([]any{"core.WriteGate"})
 	pr := &recordingProtector{inner: p, rec: rec}
 
 	rec.Run(t, scenario1, func(t *testing.T) {
-		req := core.Request{
-			RequestMeta: core.RequestMeta{
-				TargetKey:  "act-1:contact-1",
-				MessageRef: []byte("activity-A"),
-			},
-			ContentHash: "hash-A",
-		}
+		meta := core.RequestMeta{TargetKey: "act-1:contact-1", MessageRef: []byte("activity-A")}
+		const hash = "hash-A"
 		rec.Note("Check(content=hash-A, target=act-1:contact-1)")
-		out := pr.Check(ctx, req)
+		out := pr.Check(ctx, meta, hash)
 		if out.Err != nil {
 			t.Fatalf("Check: %v", out.Err)
 		}
@@ -239,15 +230,15 @@ func TestProtectorScenarios(t *testing.T) {
 		rec.Note(fmt.Sprintf("→ %s", out.Decision))
 
 		rec.Note("send to downstream succeeded → RecordAsSent")
-		if err := pr.RecordAsSent(ctx, req); err != nil {
+		if err := pr.RecordAsSent(ctx, meta, hash); err != nil {
 			t.Fatalf("RecordAsSent: %v", err)
 		}
 
 		// Verify the recorded send is reflected as TotalSent=1 for the
-		// target. Reads directly from the raw store — not via a Protector
-		// API (none exposes Metrics anymore), so this read does NOT show
-		// up as a Protector→Store arrow in the diagram.
-		met, ok, err := innerStore.ReadMetrics(ctx, req.TargetKey)
+		// target. Reads directly from the raw store — not via a gate
+		// API (none exposes Metrics), so this read does NOT show up as a
+		// Protector→Store arrow in the diagram.
+		met, ok, err := innerStore.ReadMetrics(ctx, meta.TargetKey)
 		if err != nil {
 			t.Fatalf("ReadMetrics: %v", err)
 		}
@@ -260,15 +251,10 @@ func TestProtectorScenarios(t *testing.T) {
 	})
 
 	rec.Run(t, "duplicate content to the same target is deduped", func(t *testing.T) {
-		req := core.Request{
-			RequestMeta: core.RequestMeta{
-				TargetKey:  "act-1:contact-1", // same target as scenario 1
-				MessageRef: []byte("activity-A-dup"),
-			},
-			ContentHash: "hash-A", // same content as scenario 1
-		}
+		meta := core.RequestMeta{TargetKey: "act-1:contact-1", MessageRef: []byte("activity-A-dup")}
+		const hash = "hash-A" // same content as scenario 1
 		rec.Note("Check(content=hash-A, target=act-1:contact-1)")
-		out := pr.Check(ctx, req)
+		out := pr.Check(ctx, meta, hash)
 		if out.Err != nil {
 			t.Fatalf("Check: %v", out.Err)
 		}
@@ -279,15 +265,10 @@ func TestProtectorScenarios(t *testing.T) {
 	})
 
 	rec.Run(t, "same-target follow-up within debounce window is deferred", func(t *testing.T) {
-		req := core.Request{
-			RequestMeta: core.RequestMeta{
-				TargetKey:  "act-1:contact-1", // same target as scenario 1
-				MessageRef: []byte("activity-B"),
-			},
-			ContentHash: "hash-B", // new content
-		}
+		meta := core.RequestMeta{TargetKey: "act-1:contact-1", MessageRef: []byte("activity-B")}
+		const hash = "hash-B" // new content
 		rec.Note("Check(content=hash-B, target=act-1:contact-1) — 1 send within debounce window")
-		out := pr.Check(ctx, req)
+		out := pr.Check(ctx, meta, hash)
 		if out.Err != nil {
 			t.Fatalf("Check: %v", out.Err)
 		}
@@ -311,15 +292,10 @@ func TestProtectorScenarios(t *testing.T) {
 		_ = innerStore.RecordAsSent(ctx, "act-1:contact-3", "setup-2")
 		time.Sleep(2 * debounceWindow)
 
-		req := core.Request{
-			RequestMeta: core.RequestMeta{
-				TargetKey:  "act-1:contact-3",
-				MessageRef: []byte("activity-C"),
-			},
-			ContentHash: "hash-C",
-		}
+		meta := core.RequestMeta{TargetKey: "act-1:contact-3", MessageRef: []byte("activity-C")}
+		const hash = "hash-C"
 		rec.Note("Check(content=hash-C, target=act-1:contact-3) — quota at hardCap=2, debounce window expired")
-		out := pr.Check(ctx, req)
+		out := pr.Check(ctx, meta, hash)
 		if out.Err != nil {
 			t.Fatalf("Check: %v", out.Err)
 		}
@@ -333,15 +309,10 @@ func TestProtectorScenarios(t *testing.T) {
 	})
 
 	rec.Run(t, "below-cap send proceeds; RecordAsSent appends to sendstate", func(t *testing.T) {
-		req := core.Request{
-			RequestMeta: core.RequestMeta{
-				TargetKey:  "act-1:contact-4",
-				MessageRef: []byte("activity-D"),
-			},
-			ContentHash: "hash-D",
-		}
+		meta := core.RequestMeta{TargetKey: "act-1:contact-4", MessageRef: []byte("activity-D")}
+		const hash = "hash-D"
 		rec.Note("Check(content=hash-D, target=act-1:contact-4) — counts start at 0")
-		out := pr.Check(ctx, req)
+		out := pr.Check(ctx, meta, hash)
 		if out.Err != nil {
 			t.Fatalf("Check: %v", out.Err)
 		}
@@ -349,7 +320,7 @@ func TestProtectorScenarios(t *testing.T) {
 			t.Fatalf("want Proceed, got %s", out.Decision)
 		}
 		rec.Note(fmt.Sprintf("→ %s", out.Decision))
-		if err := pr.RecordAsSent(ctx, req); err != nil {
+		if err := pr.RecordAsSent(ctx, meta, hash); err != nil {
 			t.Fatalf("RecordAsSent: %v", err)
 		}
 	})
@@ -382,13 +353,12 @@ func TestProtectorScenarios(t *testing.T) {
 
 	t.Cleanup(func() {
 		rec.WriteMermaid(t)
-		// CapPolicy is infrastructure New() uses to size the store —
-		// not part of the per-Check story this diagram tells.
-		// ReadMetrics is no longer reachable through any Protector
-		// surface (Protector.Metrics was removed); scenario 1 reads
-		// it directly off the raw store as a test verification step,
-		// which intentionally bypasses the recording wrapper so it
-		// doesn't show up as a Protector→Store arrow in the diagram.
+		// CapPolicy is infrastructure NewWrite() uses to size the store —
+		// not part of the per-Check story this diagram tells. ReadMetrics
+		// is not reachable through any gate surface; scenario 1 reads it
+		// directly off the raw store as a test verification step, which
+		// intentionally bypasses the recording wrapper so it doesn't show
+		// up as a Protector→Store arrow in the diagram.
 		rec.AssertCovered(t,
 			"Debounce.CapPolicy",
 			"Quota.CapPolicy",
