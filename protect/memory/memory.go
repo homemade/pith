@@ -24,7 +24,8 @@ import (
 )
 
 // NewReadProtector returns a [pith/protect.ReadProtector] backed by the
-// in-process memory store: coalesce caps only, capped Checks DROP.
+// in-process memory store: coalesce caps only (no content dedupe), capped
+// Checks DEFER (replayable via ReplayCandidates).
 func NewReadProtector(entryTTL time.Duration, first coalesce.Coalescer, rest ...coalesce.Coalescer) protect.ReadProtector {
 	return core.NewRead(memory.New(entryTTL), append([]coalesce.Coalescer{first}, rest...)...)
 }

@@ -37,20 +37,20 @@ type RequestMeta struct {
 	TargetKey string
 
 	// MessageRef is caller-defined data stored in the sendstate entry's
-	// LastDeferredMessageRef when a write gate's Check returns
-	// DecisionDeferred. A sweep layer reads it back to re-derive and
-	// re-emit. Typically a small reference (e.g. an upstream event ID +
-	// context, JSON-encoded). A read gate never stamps a breadcrumb, so
-	// MessageRef is unused there.
+	// LastDeferredMessageRef when a Check returns DecisionDeferred (write or
+	// read gate). A sweep layer reads it back to re-derive and re-emit.
+	// Typically a small reference (e.g. an upstream event ID + context,
+	// JSON-encoded). A write sweep re-emits the re-derived payload; a read
+	// sweep re-derives the target and re-fetches current state.
 	MessageRef []byte
 }
 
-// DeferredRequest is the unit yielded by [WriteGate.ReplayCandidates]: a
-// pending deferral whose attached Coalescer caps currently have room to
-// re-emit. It embeds [RequestMeta] (target key + breadcrumb — what the
-// consumer re-derives from and re-emits via [WriteGate.Check]) and adds
-// the timestamp of the most recent deferral, so the consumer can reason
-// about age without a second read.
+// DeferredRequest is the unit yielded by [WriteGate.ReplayCandidates] /
+// [ReadGate.ReplayCandidates]: a pending deferral whose attached Coalescer
+// caps currently have room to re-emit. It embeds [RequestMeta] (target key
+// + breadcrumb — what the consumer re-derives from and re-emits via Check)
+// and adds the timestamp of the most recent deferral, so the consumer can
+// reason about age without a second read.
 type DeferredRequest struct {
 	RequestMeta
 
@@ -76,20 +76,13 @@ const (
 	// the destination, so there is nothing to replay.
 	DecisionDeduped
 
-	// DecisionDeferred: a write gate's Coalescer cap pushed back. Reason
-	// names the Coalescer. Check stamps a deferred breadcrumb
+	// DecisionDeferred: a Coalescer cap pushed back. Reason names the
+	// Coalescer. Check stamps a deferred breadcrumb
 	// ([sendstate.Store.RecordAsDeferred]) so a consumer-side sweep can
-	// re-emit once the cap window clears. The deferred write is an action
-	// the caller still intends to perform.
+	// re-emit once the cap window clears — the deferred operation is one
+	// the caller still intends to perform (a write to retry, or a read to
+	// re-take against current state).
 	DecisionDeferred
-
-	// DecisionDropped: a read gate's Coalescer cap pushed back. Reason
-	// names the Coalescer. No breadcrumb is stamped and there is nothing
-	// to replay — a read is skippable, so the suppressed call is simply
-	// gone. Distinct from DecisionDeferred precisely because the
-	// downstream meaning differs (gone vs stashed-and-replayable), the
-	// same rationale that separates DecisionDeduped from DecisionDeferred.
-	DecisionDropped
 )
 
 // String returns the decision name (for logging).
@@ -101,8 +94,6 @@ func (d Decision) String() string {
 		return "Deduped"
 	case DecisionDeferred:
 		return "Deferred"
-	case DecisionDropped:
-		return "Dropped"
 	default:
 		return "Unknown"
 	}
@@ -118,7 +109,7 @@ type Outcome struct {
 
 	// Reason is human-readable detail for logging. Empty on a proceed;
 	// "duplicate content" on a DecisionDeduped; the Coalescer's derived
-	// name on a DecisionDeferred / DecisionDropped.
+	// name on a DecisionDeferred.
 	Reason string
 
 	// Err is the backing-store error encountered while making the
@@ -129,10 +120,11 @@ type Outcome struct {
 	Err error
 }
 
-// gate holds the shared protection policy for one store. The two
-// behaviour flags select read vs write semantics; the typed shells
-// [ReadGate] and [WriteGate] wrap a *gate and expose the right method
-// set and Check signature for each.
+// gate holds the shared protection policy for one store. The `dedupe`
+// flag is the only read-vs-write difference; the typed shells [ReadGate]
+// and [WriteGate] wrap a *gate and expose the right method set and Check
+// signature for each. Both stamp a breadcrumb on a Coalescer cap and offer
+// replay — a debounced read is re-taken against current state, not lost.
 type gate struct {
 	store      sendstate.Store
 	coalescers []coalesce.Coalescer
@@ -140,21 +132,18 @@ type gate struct {
 	// dedupe runs the Layer-1 content check (Seen) when true. Write
 	// gates set it; read gates don't (no payload to fingerprint).
 	dedupe bool
-
-	// stampDeferred selects what a Coalescer cap does. When true (write
-	// gates) Check stamps a deferred breadcrumb and returns
-	// DecisionDeferred — replayable. When false (read gates) it stamps
-	// nothing and returns DecisionDropped — the call is skipped.
-	stampDeferred bool
 }
 
-// ReadGate is the concrete read-side gate: coalescers only, no dedupe,
-// Coalescer caps DROP (no breadcrumb, no replay). It satisfies
-// [pith/protect.ReadProtector]. Construct via the factory subpackages.
+// ReadGate is the concrete read-side gate: coalescers only, no dedupe. A
+// Coalescer cap DEFERS (breadcrumb + replay), like the write gate — so a
+// debounced read is re-taken against current state by a consumer sweep, not
+// lost. It satisfies [pith/protect.ReadProtector]. Construct via the factory
+// subpackages.
 type ReadGate struct{ *gate }
 
-// Check gates a candidate read. Returns DecisionProceed or, on a
-// Coalescer cap, DecisionDropped. Never DecisionDeduped (no dedupe layer).
+// Check gates a candidate read. Returns DecisionProceed or, on a Coalescer
+// cap, DecisionDeferred (a breadcrumb is stamped for the replay sweep). Never
+// DecisionDeduped (no dedupe layer).
 func (r ReadGate) Check(ctx context.Context, meta RequestMeta) Outcome {
 	return r.check(ctx, meta, "")
 }
@@ -162,6 +151,12 @@ func (r ReadGate) Check(ctx context.Context, meta RequestMeta) Outcome {
 // RecordAsSent commits a performed read, advancing the Coalescer counts.
 func (r ReadGate) RecordAsSent(ctx context.Context, meta RequestMeta) error {
 	return r.record(ctx, meta, "")
+}
+
+// ReplayCandidates collects pending deferred reads whose Coalescer caps now
+// have room. See [gate.replay] for the full contract.
+func (r ReadGate) ReplayCandidates(ctx context.Context, limit int) ([]DeferredRequest, error) {
+	return r.replay(ctx, limit)
 }
 
 // WriteGate is the concrete write-side gate: content dedupe + coalescers,
@@ -191,14 +186,14 @@ func (w WriteGate) ReplayCandidates(ctx context.Context, limit int) ([]DeferredR
 // least one is required; see [newGate]). Internal — called by the factory
 // subpackages.
 func NewRead(store sendstate.Store, coalescers ...coalesce.Coalescer) ReadGate {
-	return ReadGate{newGate(store, false, false, coalescers)}
+	return ReadGate{newGate(store, false, coalescers)}
 }
 
 // NewWrite builds a write gate over store with the given Coalescers (at
 // least one is required; see [newGate]). Internal — called by the factory
 // subpackages.
 func NewWrite(store sendstate.Store, coalescers ...coalesce.Coalescer) WriteGate {
-	return WriteGate{newGate(store, true, true, coalescers)}
+	return WriteGate{newGate(store, true, coalescers)}
 }
 
 // LargestHardCap returns the largest hardCap among coalescers, or 0 when
@@ -228,7 +223,7 @@ func LargestHardCap(coalescers ...coalesce.Coalescer) int {
 // Coalescer names (from [coalesce.Coalescer.CapPolicy]) must be unique —
 // Check surfaces the name in Outcome.Reason, so two caps sharing a name
 // would be ambiguous (panic on collision).
-func newGate(store sendstate.Store, dedupe, stampDeferred bool, coalescers []coalesce.Coalescer) *gate {
+func newGate(store sendstate.Store, dedupe bool, coalescers []coalesce.Coalescer) *gate {
 	if store == nil {
 		panic("protect: a gate requires a non-nil store")
 	}
@@ -262,7 +257,7 @@ func newGate(store sendstate.Store, dedupe, stampDeferred bool, coalescers []coa
 		sz.GrowMaxSendTimes(maxCap)
 	}
 
-	return &gate{store: store, coalescers: coalescers, dedupe: dedupe, stampDeferred: stampDeferred}
+	return &gate{store: store, coalescers: coalescers, dedupe: dedupe}
 }
 
 // check applies dedupe (write gates only) and each attached Coalescer in
@@ -275,10 +270,9 @@ func newGate(store sendstate.Store, dedupe, stampDeferred bool, coalescers []coa
 //     No store write on this path.
 //   - DecisionDeduped: dedupe matched the last send's contentHash (write
 //     gates only). No store write — nothing to replay.
-//   - DecisionDeferred / DecisionDropped: a Coalescer cap fired. A write
-//     gate (stampDeferred) stamps a deferred breadcrumb and returns
-//     DecisionDeferred; a read gate stamps nothing and returns
-//     DecisionDropped.
+//   - DecisionDeferred: a Coalescer cap fired. Check stamps a deferred
+//     breadcrumb for the consumer sweep and returns DecisionDeferred — read
+//     and write gates alike.
 //
 // Backing-store errors are fail-open via [Outcome.Err]: a ReadEntry
 // failure yields (DecisionProceed, Err); a failed RecordAsDeferred stamp
@@ -299,10 +293,6 @@ func (g *gate) check(ctx context.Context, meta RequestMeta, contentHash string) 
 	for _, c := range g.coalescers {
 		if c.ShouldDefer(entry, now) {
 			capName, _, _ := c.CapPolicy()
-			if !g.stampDeferred {
-				// Read gate: skip the call, stash nothing.
-				return Outcome{Decision: DecisionDropped, Reason: capName}
-			}
 			recErr := g.store.RecordAsDeferred(ctx, meta.TargetKey, meta.MessageRef)
 			return Outcome{Decision: DecisionDeferred, Reason: capName, Err: recErr}
 		}
@@ -329,9 +319,11 @@ func (g *gate) record(ctx context.Context, meta RequestMeta, contentHash string)
 // deferral first — see [sendstate.Store.RangeDeferred]). limit bounds the
 // entries examined, not the slice returned; limit <= 0 means no bound.
 //
-// The gate covers only the caps (pure CountSentInWindow arithmetic, no
-// I/O). Dedupe is not applied here — it still runs when the consumer
-// re-emits each candidate via [WriteGate.Check].
+// The gate covers only the caps (pure CountSentInWindow /
+// CountDeferredInWindow arithmetic, no I/O). Dedupe is not applied here —
+// on a write gate it still runs when the consumer re-emits each candidate
+// via [WriteGate.Check]; a read gate ([ReadGate.Check]) has no dedupe and
+// re-takes the read against current state.
 func (g *gate) replay(ctx context.Context, limit int) ([]DeferredRequest, error) {
 	var out []DeferredRequest
 	err := g.store.RangeDeferred(ctx, limit, func(key string, e sendstate.Entry) bool {

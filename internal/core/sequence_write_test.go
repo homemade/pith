@@ -149,7 +149,7 @@ func (r *recordingSendStore) RecordAsDeferred(ctx context.Context, key string, m
 
 // TestWriteGateScenarios exercises each [core.WriteGate] Check decision
 // branch and emits a Mermaid sequence diagram next to this file
-// (sequence_test.md).
+// (sequence_write_test.md).
 func TestWriteGateScenarios(t *testing.T) {
 	rec := sequencerec.New()
 	rec.SetActor("Client")

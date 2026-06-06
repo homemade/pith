@@ -6,7 +6,7 @@ Protect Integration THresholds with Go: per-key cap policies (debounce, quota, c
 
 - [`pith/sendstate`](sendstate/) — shared per-key state split across two stores (mirroring two backend collections): the TTL'd **`Entry`** (content-hash, last-deferred message-ref, rolling send-timestamp list) read via `ReadEntry`, and the permanent **`Metrics`** rollup (lifetime counters + last-sent/deferred times) read via `ReadMetrics`. `Entry` carries the read primitives directly: `Seen(contentHash)` (content dedupe — is this identical to the last send?), `CountSentInWindow(now, window)` (per-window send count), and its deferral mirror `CountDeferredInWindow(now, window)` (deferral cadence, for replay-sweep eligibility — e.g. trailing-edge "gone quiet" == 0). The `Entry` store behaves like a Mongo TTL index (`expireAt` + `expireAfterSeconds: 0`) with TTL-honoring reads, so expiry never affects answers. A send touches only send-side state — a deferral is "pending" purely by being more recent than the last send (nothing is cleared)
 - [`pith/coalesce`](coalesce/) — per-key cap policy ("at most hardCap successful sends per window"); one-method read-only policy (`ShouldDefer`), a pure function over a `sendstate.Entry` (via `Entry.CountSentInWindow`). Multiple Coalescers can be attached at different `(hardCap, window)` pairs
-- [`pith/protect`](protect/) — composition layer exposing **two capability-typed gates**. A [`WriteProtector`](protect/) guards a content-bearing operation (send / merge / PATCH): `Check(meta, contentHash)` applies content dedupe (`Entry.Seen`) then each attached Coalescer, returning `DecisionDeduped` on a content match or `DecisionDeferred` on a cap — a deferred write stamps a breadcrumb and is replayable via `ReplayCandidates`. A [`ReadProtector`](protect/) guards a content-free operation (read / poll / event / trigger): `Check(meta)` applies coalesce caps only (no dedupe, no hash), returning `DecisionDropped` on a cap — a dropped read is skipped, with no breadcrumb and nothing to replay. The names track the replay axis: a write is retryable, a read is skippable. Read-only access to per-key state is deliberately off the gate facades — observability and tests read `sendstate.Entry` / `sendstate.Metrics` via `sendstate.Store` directly. See the [godoc](https://pkg.go.dev/github.com/homemade/pith/protect) for the full mechanism set and the Check / RecordAsSent / replay contract.
+- [`pith/protect`](protect/) — composition layer exposing **two capability-typed gates**. A [`WriteProtector`](protect/) guards a content-bearing operation (send / merge / PATCH): `Check(meta, contentHash)` applies content dedupe (`Entry.Seen`) then each attached Coalescer, returning `DecisionDeduped` on a content match or `DecisionDeferred` on a cap — a deferred write stamps a breadcrumb and is replayable via `ReplayCandidates`. A [`ReadProtector`](protect/) guards a content-free operation (read / poll / event / trigger): `Check(meta)` applies coalesce caps only (no dedupe, no hash), returning `DecisionDeferred` on a cap — like a write, a capped read stamps a breadcrumb and is replayable via `ReplayCandidates`, except the replay re-fetches *current* state rather than re-emitting a payload (re-reading after the burst settles captures the final value). Both gates defer (not drop) a cap, because a cap can suppress the final, changed state; only dedupe is safe to drop without replay (the duplicate is already at the destination), which is why dedupe is write-only. Pair a read gate with `NewTrailingEdgeDebounce` so a sustained burst collapses to one final read. Read-only access to per-key state is deliberately off the gate facades — observability and tests read `sendstate.Entry` / `sendstate.Metrics` via `sendstate.Store` directly. See the [godoc](https://pkg.go.dev/github.com/homemade/pith/protect) for the full mechanism set and the Check / RecordAsSent / replay contract.
 
 ## Backends
 
@@ -98,13 +98,14 @@ This repo follows [Semantic Versioning 2.0.0](https://semver.org/). Git tags use
 - **MINOR** — backwards-compatible additions
 - **PATCH** — backwards-compatible fixes
 
-**`v2.0.0`** replaces the single always-dedupe `protect.Protector` (and its
-`protect.New` / `WithCoalescer` / `Request` surface) with the two
-capability-typed gates `ReadProtector` and `WriteProtector` described above —
-dedupe is no longer always-on but a property of the write gate, content-free
-read gates are now expressible, and `Check` takes the content hash as an
-argument rather than on a request struct. Consumers pin via Go modules:
+While pith has a single in-lockstep consumer it ships breaking changes as
+**minor** bumps (rather than a MAJOR), to avoid the Go `/v2` module-path
+suffix and a matching import rewrite for no real benefit at one internal
+client; the consumer is updated in the same release. Revisit if pith gains
+external consumers.
+
+Consumers pin via Go modules:
 
 ```
-require github.com/homemade/pith v2.0.0
+require github.com/homemade/pith v1.4.0
 ```

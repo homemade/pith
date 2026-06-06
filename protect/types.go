@@ -33,13 +33,11 @@ type Decision = core.Decision
 //
 //   - DecisionProceed — perform the operation, then RecordAsSent on success.
 //   - DecisionDeduped — drop; identical content to the last send (write only).
-//   - DecisionDeferred — a write's cap fired; stashed for replay.
-//   - DecisionDropped — a read's cap fired; skipped, nothing to replay.
+//   - DecisionDeferred — a cap fired; stashed for replay (read or write).
 const (
 	DecisionProceed  = core.DecisionProceed
 	DecisionDeduped  = core.DecisionDeduped
 	DecisionDeferred = core.DecisionDeferred
-	DecisionDropped  = core.DecisionDropped
 )
 
 // Outcome reports a Check result. See [core.Outcome].
@@ -47,20 +45,32 @@ type Outcome = core.Outcome
 
 // ReadProtector guards a content-free operation — a read, poll, inbound
 // event, or fire-and-forget trigger — with one or more coalesce cap
-// policies and no content dedupe. A capped Check is DROPPED: the call is
-// skippable, so it is simply suppressed (no breadcrumb, nothing to
-// replay). Construct via [pith/protect/memory.NewReadProtector] or
+// policies and no content dedupe. A capped Check is DEFERRED: a breadcrumb
+// is stashed and [ReadProtector.ReplayCandidates] yields it so a consumer
+// sweep re-takes the read against current state once the cap clears (the
+// final state is never lost — a dropped cap-suppression would lose it).
+// Pair it with a [pith/coalesce.NewTrailingEdgeDebounce] so a sustained
+// burst collapses to a single final read after quiet. A caller wanting a
+// pure poll throttle can ignore ReplayCandidates / run no sweep; deferred
+// entries then simply TTL out. Construct via
+// [pith/protect/memory.NewReadProtector] or
 // [pith/protect/mongodb.NewReadProtector].
 type ReadProtector interface {
 	// Check gates a candidate read. Returns DecisionProceed or, on a
-	// Coalescer cap, DecisionDropped. Never DecisionDeduped. On a backing-
-	// store read error it fails open (DecisionProceed) with Outcome.Err
-	// set.
+	// Coalescer cap, DecisionDeferred (a breadcrumb is stamped for the
+	// replay sweep). Never DecisionDeduped. Fails open (DecisionProceed)
+	// with Outcome.Err set on a backing-store read error.
 	Check(ctx context.Context, meta RequestMeta) Outcome
 
 	// RecordAsSent commits a performed read, advancing the cap counts.
-	// Call only after the operation succeeded.
+	// Call only after the read succeeded.
 	RecordAsSent(ctx context.Context, meta RequestMeta) error
+
+	// ReplayCandidates collects pending deferred reads whose Coalescer caps
+	// now have room, oldest deferral first; limit bounds the entries
+	// examined (<= 0 means no bound). The consumer re-derives each from
+	// MessageRef and re-takes the read via Check.
+	ReplayCandidates(ctx context.Context, limit int) ([]DeferredRequest, error)
 }
 
 // WriteProtector guards a content-bearing operation — a send/merge/PATCH

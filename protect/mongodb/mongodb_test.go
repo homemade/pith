@@ -139,8 +139,9 @@ func TestNewWriteProtector_AutoDerivesMaxSendTimesFromCoalescers(t *testing.T) {
 }
 
 // A read protector built against a real mongo backend has no dedupe and
-// DROPS a capped read.
-func TestNewReadProtector_DropsAtCap(t *testing.T) {
+// DEFERS a capped read — stamping a breadcrumb that becomes a replay
+// candidate once the cap clears.
+func TestNewReadProtector_DefersAtCap(t *testing.T) {
 	if testURI == "" {
 		t.Skip("no MongoDB container (Docker unavailable)")
 	}
@@ -161,16 +162,26 @@ func TestNewReadProtector_DropsAtCap(t *testing.T) {
 		_ = client.Disconnect(context.Background())
 	})
 
-	meta := protect.RequestMeta{TargetKey: "r1"}
+	meta := protect.RequestMeta{TargetKey: "r1", MessageRef: []byte("ref-1")}
 	if out := r.Check(ctx, meta); out.Decision != protect.DecisionProceed || out.Err != nil {
 		t.Fatalf("first Check = %s, err=%v; want Proceed", out.Decision, out.Err)
 	}
 	if err := r.RecordAsSent(ctx, meta); err != nil {
 		t.Fatalf("RecordAsSent: %v", err)
 	}
-	// Quota of 1 is now reached → the next read is DROPPED (not deferred).
-	if out := r.Check(ctx, meta); out.Decision != protect.DecisionDropped {
-		t.Fatalf("over-cap Check = %s, want Dropped", out.Decision)
+	// Quota of 1 is now reached → the next read is DEFERRED (breadcrumb
+	// stamped), not dropped.
+	if out := r.Check(ctx, meta); out.Decision != protect.DecisionDeferred {
+		t.Fatalf("over-cap Check = %s, want Deferred", out.Decision)
+	}
+	// The deferral is not yet a replay candidate (the 24h quota window has
+	// not cleared) — but the breadcrumb is recorded.
+	cands, err := r.ReplayCandidates(ctx, 0)
+	if err != nil {
+		t.Fatalf("ReplayCandidates: %v", err)
+	}
+	if len(cands) != 0 {
+		t.Fatalf("ReplayCandidates = %+v, want none while the quota window is full", cands)
 	}
 }
 

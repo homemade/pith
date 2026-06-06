@@ -33,9 +33,10 @@ import (
 type Config = mongostore.Config
 
 // NewReadProtector returns a [pith/protect.ReadProtector] backed by an
-// Atlas mongo store (coalesce caps only, capped Checks DROP), plus the
-// underlying *mongo.Client (so callers can Disconnect at shutdown), or an
-// error. MaxSendTimes is handled as described on [NewWriteProtector].
+// Atlas mongo store (coalesce caps only, no content dedupe; capped Checks
+// DEFER and are replayable via ReplayCandidates), plus the underlying
+// *mongo.Client (so callers can Disconnect at shutdown), or an error.
+// MaxSendTimes is handled as described on [NewWriteProtector].
 func NewReadProtector(ctx context.Context, cfg Config, first coalesce.Coalescer, rest ...coalesce.Coalescer) (protect.ReadProtector, *mongo.Client, error) {
 	coalescers := append([]coalesce.Coalescer{first}, rest...)
 	store, client, err := open(ctx, cfg, coalescers)

@@ -44,8 +44,9 @@ func TestNewWriteProtector(t *testing.T) {
 	}
 }
 
-// A read protector has no dedupe and DROPS (not defers) a too-frequent
-// read — and takes no contentHash.
+// A read protector has no dedupe and DEFERS (not drops) a too-frequent
+// read — stamping a breadcrumb so a sweep can re-take it — and takes no
+// contentHash.
 func TestNewReadProtector(t *testing.T) {
 	const debounce = 30 * time.Millisecond
 	p := memprotect.NewReadProtector(
@@ -53,7 +54,7 @@ func TestNewReadProtector(t *testing.T) {
 		coalesce.NewLeadingEdgeDebounce(debounce),
 	)
 	ctx := context.Background()
-	meta := protect.RequestMeta{TargetKey: "k1"}
+	meta := protect.RequestMeta{TargetKey: "k1", MessageRef: []byte("ref-1")}
 
 	// First Check proceeds.
 	if out := p.Check(ctx, meta); out.Decision != protect.DecisionProceed {
@@ -63,8 +64,19 @@ func TestNewReadProtector(t *testing.T) {
 		t.Fatalf("RecordAsSent: %v", err)
 	}
 
-	// Within the window → dropped (a read is skippable, not replayable).
-	if out := p.Check(ctx, meta); out.Decision != protect.DecisionDropped {
-		t.Fatalf("repeat Check = %s, want Dropped", out.Decision)
+	// Within the window → deferred (a cap suppression is replayable, not lost).
+	if out := p.Check(ctx, meta); out.Decision != protect.DecisionDeferred {
+		t.Fatalf("repeat Check = %s, want Deferred", out.Decision)
+	}
+
+	// The deferral left a breadcrumb; once the window clears it is a replay
+	// candidate (re-derived from MessageRef, re-read against current state).
+	time.Sleep(2 * debounce)
+	cands, err := p.ReplayCandidates(ctx, 0)
+	if err != nil {
+		t.Fatalf("ReplayCandidates: %v", err)
+	}
+	if len(cands) != 1 || string(cands[0].MessageRef) != "ref-1" {
+		t.Fatalf("ReplayCandidates = %+v, want 1 candidate with MessageRef ref-1", cands)
 	}
 }

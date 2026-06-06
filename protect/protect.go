@@ -16,24 +16,29 @@
 //   - [ReadProtector] — a content-free operation (a read, poll, inbound
 //     event, fire-and-forget trigger). Applies coalesce caps only — there
 //     is no payload to fingerprint, so no dedupe. A capped Check is
-//     DROPPED: the call is skippable, so it is simply suppressed — no
-//     breadcrumb, nothing to replay. Its Check takes no hash.
+//     DEFERRED: re-taking the read against current state is still an action
+//     you intend to perform, so a breadcrumb is stashed and
+//     ReplayCandidates yields it for a sweep to re-read once the cap clears.
+//     Its Check takes no hash.
 //
-// The names track the replay axis: a write is retryable (deferred and
-// replayed), a read is skippable (dropped). The same axis is why dedupe
-// belongs only to the write side — a duplicate content suppression is
-// never replayable, the duplicate is already at the destination.
+// Both gates defer (not drop) a capped Check, because a cap suppresses
+// whatever arrived at the wrong moment — which may be the final, changed
+// state — so it must be replayed, not lost. Only dedupe is safe to drop
+// without replay (the duplicate is already at the destination); that is why
+// dedupe belongs to the write side alone. A write replays the stashed
+// payload; a read replays the *act of reading*, re-fetching current state —
+// re-reading after the burst settles captures exactly the final value.
 //
 // # Limitation
 //
 // The two gates cover the two combinations that arise in practice:
-// content-bearing + retryable (write) and content-free + skippable (read).
-// An operation that is content-free but must NOT be skipped — a bodiless
-// mutation you still need to retry, e.g. a DELETE or fire-once trigger —
-// fits neither: a WriteProtector would dedupe on an empty hash, a
-// ReadProtector would drop it. No such case exists today; if one arises it
-// wants a third gate (or decoupling the replay decision from content
-// presence). These are behavioural bundles, not an HTTP-method taxonomy.
+// content-bearing + dedupe (write) and content-free, no-dedupe (read) —
+// both replay a capped Check. An operation that is content-bearing but must
+// be re-emitted *without* dedupe (replay every cap-suppressed payload, even
+// an unchanged one) fits neither cleanly. No such case exists today; if one
+// arises it wants a third gate (or decoupling the dedupe decision from
+// content presence). These are behavioural bundles, not an HTTP-method
+// taxonomy.
 //
 // # The mechanism set
 //
@@ -63,11 +68,12 @@
 //
 // # Outcomes
 //
-// A read gate's Check returns DecisionProceed or DecisionDropped. A write
+// A read gate's Check returns DecisionProceed or DecisionDeferred. A write
 // gate's returns DecisionProceed, DecisionDeduped, or DecisionDeferred.
-// Dropped and Deferred are distinct constants because their downstream
-// meaning differs — a dropped read is gone; a deferred write is stashed
-// and will replay.
+// DecisionDeferred means the same thing on both gates — a cap fired, a
+// breadcrumb is stashed, and the request will replay once the cap clears;
+// only the write gate adds DecisionDeduped (an identical payload, dropped
+// silently — nothing to replay).
 //
 // # Construction
 //
@@ -113,15 +119,16 @@
 //	    // a Coalescer cap fired; a breadcrumb is stamped for the sweep.
 //	}
 //
-// A read gate is the same shape without the hash and with no Deduped /
-// Deferred arm:
+// A read gate is the same shape without the hash and with no Deduped arm —
+// a capped read defers (and a sweep replays it) rather than dropping:
 //
 //	out := r.Check(ctx, meta)
 //	switch out.Decision {
 //	case protect.DecisionProceed:
 //	    if doRead() { _ = r.RecordAsSent(ctx, meta) }
-//	case protect.DecisionDropped:
-//	    // too-frequent; skip this read.
+//	case protect.DecisionDeferred:
+//	    // a Coalescer cap fired; a breadcrumb is stamped — a sweep
+//	    // (ReplayCandidates) will re-take this read once the cap clears.
 //	}
 //
 // Backing-store errors are fail-open: a non-nil Outcome.Err carries
@@ -129,15 +136,23 @@
 // work. RecordAsSent is record-on-success — a failed operation leaves the
 // slot unrecorded so a retry isn't suppressed.
 //
-// # Deferred breadcrumbs and the consumer-side sweep (write gates)
+// # Deferred breadcrumbs and the consumer-side sweep
 //
 // On every DecisionDeferred, Check calls [sendstate.Store.RecordAsDeferred]
 // to store the request's MessageRef and append to LastNDeferredTimes. A
 // consumer-side sweep scans for entries with a pending deferral (most
-// recent deferral newer than the most recent send), re-derives the
-// payload from MessageRef, and re-emits via Check;
-// [WriteProtector.ReplayCandidates] yields the ones whose caps now have
-// room. A successful RecordAsSent makes the send the most recent event,
-// so the entry is no longer pending — recency alone resolves it. Read
-// gates stamp no breadcrumb (DecisionDropped), so they have no sweep.
+// recent deferral newer than the most recent send), re-derives from
+// MessageRef, and re-emits via Check; [WriteProtector.ReplayCandidates] /
+// [ReadProtector.ReplayCandidates] yield the ones whose caps now have room.
+// A write sweep re-emits the stashed payload; a read sweep re-fetches
+// current state. A successful RecordAsSent makes the send the most recent
+// event, so the entry is no longer pending — recency alone resolves it.
+//
+// Both gates run this sweep — the read gate is replay-capable, the same
+// machinery as the write gate minus dedupe. pith fires no timers itself:
+// the replay/trailing fire happens when a consumer sweep next runs after the
+// cap clears — under continuous traffic (a sweep at each request tail) within
+// a request or two of going quiet; if all traffic stops, at the next request
+// or a cron sweep. A caller that genuinely wants a fire-and-forget poll
+// throttle can simply not run a sweep — the deferred entries then TTL out.
 package protect
