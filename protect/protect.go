@@ -75,6 +75,19 @@
 // only the write gate adds DecisionDeduped (an identical payload, dropped
 // silently — nothing to replay).
 //
+// # Replay scope
+//
+// A replay sweep ([ReadProtector.ReplayCandidates] /
+// [WriteProtector.ReplayCandidates]) enumerates the WHOLE store; it cannot
+// be scoped to a subset of keys. TargetKey addresses Check / RecordAsSent —
+// it does not partition the sweep. So two logically independent streams that
+// each defer-and-replay must live in SEPARATE stores (a distinct Database in
+// the [pith/protect/mongodb] factory), never one store distinguished by key
+// prefix. Sharing a store lets one stream's sweep drain and resolve the
+// other's pending deferrals — re-deriving and re-emitting them through the
+// wrong consumer. The collection boundary is the only replay isolation pith
+// offers; partition by store, not by key.
+//
 // # Construction
 //
 // Construct via a factory subpackage — the public API exposes no way to

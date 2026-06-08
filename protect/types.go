@@ -70,6 +70,13 @@ type ReadProtector interface {
 	// now have room, oldest deferral first; limit bounds the entries
 	// examined (<= 0 means no bound). The consumer re-derives each from
 	// MessageRef and re-takes the read via Check.
+	//
+	// Replay scope: a sweep enumerates the WHOLE store and cannot be scoped
+	// to a subset of keys (TargetKey addresses Check/RecordAsSent, not the
+	// sweep). So independently-replayed streams must live in SEPARATE stores
+	// (a distinct Database in the Mongo factory), never one store split by
+	// key prefix — otherwise one stream's sweep drains and resolves another's
+	// pending entries, re-running them through the wrong consumer.
 	ReplayCandidates(ctx context.Context, limit int) ([]DeferredRequest, error)
 }
 
@@ -98,5 +105,12 @@ type WriteProtector interface {
 	// have room, oldest deferral first; limit bounds the entries examined
 	// (<= 0 means no bound). The consumer re-derives each from MessageRef
 	// and re-emits via Check.
+	//
+	// Replay scope: a sweep enumerates the WHOLE store and cannot be scoped
+	// to a subset of keys (TargetKey addresses Check/RecordAsSent, not the
+	// sweep). So independently-replayed streams must live in SEPARATE stores
+	// (a distinct Database in the Mongo factory), never one store split by
+	// key prefix — otherwise one stream's sweep drains and resolves another's
+	// pending entries, re-running them through the wrong consumer.
 	ReplayCandidates(ctx context.Context, limit int) ([]DeferredRequest, error)
 }
