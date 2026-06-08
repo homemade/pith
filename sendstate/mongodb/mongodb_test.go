@@ -100,7 +100,7 @@ func TestStore_RecordAsSentThenRead(t *testing.T) {
 	s := newStore(t, time.Hour)
 	ctx := context.Background()
 
-	if err := s.RecordAsSent(ctx, "k1", "hash-A"); err != nil {
+	if err := s.RecordAsSent(ctx, "k1", "", "hash-A"); err != nil {
 		t.Fatalf("RecordAsSent: %v", err)
 	}
 
@@ -161,8 +161,8 @@ func TestStore_Seen(t *testing.T) {
 		t.Fatalf("fresh entry should not report Seen")
 	}
 
-	_ = s.RecordAsSent(ctx, "k1", "hash-A")
-	_ = s.RecordAsSent(ctx, "k1", "hash-B")
+	_ = s.RecordAsSent(ctx, "k1", "", "hash-A")
+	_ = s.RecordAsSent(ctx, "k1", "", "hash-B")
 
 	entry, _ = s.ReadEntry(ctx, "k1")
 	if entry.ContentHash != "hash-B" {
@@ -186,8 +186,8 @@ func TestStore_RecordAsDeferred(t *testing.T) {
 
 	// Send then defer: the deferral is now pending and the breadcrumb
 	// is stored; send-side state is preserved.
-	_ = s.RecordAsSent(ctx, "k1", "hash-A")
-	if err := s.RecordAsDeferred(ctx, "k1", []byte("ref-A")); err != nil {
+	_ = s.RecordAsSent(ctx, "k1", "", "hash-A")
+	if err := s.RecordAsDeferred(ctx, "k1", "", []byte("ref-A")); err != nil {
 		t.Fatalf("RecordAsDeferred: %v", err)
 	}
 	entry, _ := s.ReadEntry(ctx, "k1")
@@ -204,7 +204,7 @@ func TestStore_RecordAsDeferred(t *testing.T) {
 
 	// A later send supersedes the deferral by recency — the breadcrumb
 	// is NOT cleared (just no longer pending).
-	_ = s.RecordAsSent(ctx, "k1", "hash-B")
+	_ = s.RecordAsSent(ctx, "k1", "", "hash-B")
 	entry, _ = s.ReadEntry(ctx, "k1")
 	if !bytes.Equal(entry.LastDeferredMessageRef, []byte("ref-A")) {
 		t.Fatalf("ref should be preserved (not cleared) by RecordAsSent, got %q", entry.LastDeferredMessageRef)
@@ -225,7 +225,7 @@ func TestStore_FirstSentAtAndFirstDeferredAt(t *testing.T) {
 	ctx := context.Background()
 
 	// Send side.
-	_ = s.RecordAsSent(ctx, "k1", "h1")
+	_ = s.RecordAsSent(ctx, "k1", "", "h1")
 	met, _, _ := s.ReadMetrics(ctx, "k1")
 	first := met.FirstSentAt
 	if first.IsZero() {
@@ -233,7 +233,7 @@ func TestStore_FirstSentAtAndFirstDeferredAt(t *testing.T) {
 	}
 
 	time.Sleep(10 * time.Millisecond)
-	_ = s.RecordAsSent(ctx, "k1", "h2")
+	_ = s.RecordAsSent(ctx, "k1", "", "h2")
 	met, _, _ = s.ReadMetrics(ctx, "k1")
 	// Mongo stores timestamps at millisecond precision, so use ~Equal rather
 	// than strict equality after a round-trip.
@@ -245,7 +245,7 @@ func TestStore_FirstSentAtAndFirstDeferredAt(t *testing.T) {
 	}
 
 	// Defer side.
-	_ = s.RecordAsDeferred(ctx, "k2", []byte("ref-1"))
+	_ = s.RecordAsDeferred(ctx, "k2", "", []byte("ref-1"))
 	met, _, _ = s.ReadMetrics(ctx, "k2")
 	firstD := met.FirstDeferredAt
 	if firstD.IsZero() {
@@ -253,7 +253,7 @@ func TestStore_FirstSentAtAndFirstDeferredAt(t *testing.T) {
 	}
 
 	time.Sleep(10 * time.Millisecond)
-	_ = s.RecordAsDeferred(ctx, "k2", []byte("ref-2"))
+	_ = s.RecordAsDeferred(ctx, "k2", "", []byte("ref-2"))
 	met, _, _ = s.ReadMetrics(ctx, "k2")
 	if !met.FirstDeferredAt.Equal(firstD) {
 		t.Fatalf("FirstDeferredAt should be unchanged on subsequent deferral, got %v want %v", met.FirstDeferredAt, firstD)
@@ -262,7 +262,7 @@ func TestStore_FirstSentAtAndFirstDeferredAt(t *testing.T) {
 	// Cross-side: deferral creates the metrics doc, then a send fires.
 	// FirstSentAt must reflect the send's timestamp (set via $min on a
 	// previously-missing field — the prior defer didn't write it).
-	_ = s.RecordAsDeferred(ctx, "k3", []byte("ref"))
+	_ = s.RecordAsDeferred(ctx, "k3", "", []byte("ref"))
 	met, _, _ = s.ReadMetrics(ctx, "k3")
 	deferAt := met.FirstDeferredAt
 	if !met.FirstSentAt.IsZero() {
@@ -270,7 +270,7 @@ func TestStore_FirstSentAtAndFirstDeferredAt(t *testing.T) {
 	}
 
 	time.Sleep(10 * time.Millisecond)
-	_ = s.RecordAsSent(ctx, "k3", "h")
+	_ = s.RecordAsSent(ctx, "k3", "", "h")
 	met, _, _ = s.ReadMetrics(ctx, "k3")
 	if met.FirstSentAt.IsZero() {
 		t.Fatalf("FirstSentAt should be set after the first send")
@@ -288,7 +288,7 @@ func TestStore_LastNSendTimesCap(t *testing.T) {
 	ctx := context.Background()
 
 	for range 10 {
-		_ = s.RecordAsSent(ctx, "k1", "h")
+		_ = s.RecordAsSent(ctx, "k1", "", "h")
 	}
 
 	entry, _ := s.ReadEntry(ctx, "k1")
@@ -310,7 +310,7 @@ func TestStore_ReadEntryHonorsTTL(t *testing.T) {
 	// before Mongo's background deleter runs.
 	s := newStore(t, 50*time.Millisecond)
 	ctx := context.Background()
-	_ = s.RecordAsSent(ctx, "k1", "hash-A")
+	_ = s.RecordAsSent(ctx, "k1", "", "hash-A")
 
 	time.Sleep(150 * time.Millisecond)
 
@@ -333,20 +333,20 @@ func TestStore_RangeDeferred(t *testing.T) {
 	ctx := context.Background()
 
 	// Not pending: deferral then a later send (superseded).
-	_ = s.RecordAsDeferred(ctx, "k-superseded", []byte("x"))
-	_ = s.RecordAsSent(ctx, "k-superseded", "h")
+	_ = s.RecordAsDeferred(ctx, "k-superseded", "", []byte("x"))
+	_ = s.RecordAsSent(ctx, "k-superseded", "", "h")
 	// Not pending: only ever sent.
-	_ = s.RecordAsSent(ctx, "k-sent-only", "h")
+	_ = s.RecordAsSent(ctx, "k-sent-only", "", "h")
 
 	// Three pending, deferred oldest→newest.
-	_ = s.RecordAsDeferred(ctx, "k1", []byte("r1"))
+	_ = s.RecordAsDeferred(ctx, "k1", "", []byte("r1"))
 	time.Sleep(5 * time.Millisecond)
-	_ = s.RecordAsDeferred(ctx, "k2", []byte("r2"))
+	_ = s.RecordAsDeferred(ctx, "k2", "", []byte("r2"))
 	time.Sleep(5 * time.Millisecond)
-	_ = s.RecordAsDeferred(ctx, "k3", []byte("r3"))
+	_ = s.RecordAsDeferred(ctx, "k3", "", []byte("r3"))
 
 	var got []string
-	if err := s.RangeDeferred(ctx, 0, func(key string, e sendstate.Entry) bool {
+	if err := s.RangeDeferred(ctx, 0, "", func(key string, e sendstate.Entry) bool {
 		got = append(got, key)
 		if len(e.LastDeferredMessageRef) == 0 {
 			t.Errorf("%s yielded without a breadcrumb", key)
@@ -361,7 +361,7 @@ func TestStore_RangeDeferred(t *testing.T) {
 
 	// Bounded picks the oldest N.
 	var bounded []string
-	_ = s.RangeDeferred(ctx, 2, func(key string, _ sendstate.Entry) bool {
+	_ = s.RangeDeferred(ctx, 2, "", func(key string, _ sendstate.Entry) bool {
 		bounded = append(bounded, key)
 		return true
 	})
@@ -370,14 +370,61 @@ func TestStore_RangeDeferred(t *testing.T) {
 	}
 
 	// A send on k2 makes it no longer pending.
-	_ = s.RecordAsSent(ctx, "k2", "h")
+	_ = s.RecordAsSent(ctx, "k2", "", "h")
 	got = nil
-	_ = s.RangeDeferred(ctx, 0, func(key string, _ sendstate.Entry) bool {
+	_ = s.RangeDeferred(ctx, 0, "", func(key string, _ sendstate.Entry) bool {
 		got = append(got, key)
 		return true
 	})
 	if len(got) != 2 || got[0] != "k1" || got[1] != "k3" {
 		t.Fatalf("after send on k2, pending = %v, want [k1 k3]", got)
+	}
+}
+
+// A namespace-scoped RangeDeferred visits only its own namespace (served by the
+// {namespace, lastDeferredAt} index), with limit applied within it; "" spans all.
+func TestStore_RangeDeferred_Namespace(t *testing.T) {
+	s := newStore(t, time.Hour)
+	ctx := context.Background()
+
+	// tenant-a deferred oldest, so a namespace-blind oldest-first sweep would
+	// surface them before tenant-b's b1.
+	_ = s.RecordAsDeferred(ctx, "a1", "tenant-a", []byte("ra1"))
+	time.Sleep(5 * time.Millisecond)
+	_ = s.RecordAsDeferred(ctx, "a2", "tenant-a", []byte("ra2"))
+	time.Sleep(5 * time.Millisecond)
+	_ = s.RecordAsDeferred(ctx, "a3", "tenant-a", []byte("ra3"))
+	time.Sleep(5 * time.Millisecond)
+	_ = s.RecordAsDeferred(ctx, "b1", "tenant-b", []byte("rb1"))
+	time.Sleep(5 * time.Millisecond)
+	_ = s.RecordAsDeferred(ctx, "u1", "", []byte("ru1"))
+
+	collect := func(limit int, namespace string) []string {
+		var ks []string
+		_ = s.RangeDeferred(ctx, limit, namespace, func(k string, _ sendstate.Entry) bool {
+			ks = append(ks, k)
+			return true
+		})
+		return ks
+	}
+
+	// tenant-b's sweep sees only b1, despite tenant-a's older deferrals.
+	if b := collect(0, "tenant-b"); len(b) != 1 || b[0] != "b1" {
+		t.Fatalf("namespace tenant-b = %v, want [b1] (not blocked by tenant-a)", b)
+	}
+	// tenant-a oldest-first, limit applies within the namespace.
+	if a := collect(2, "tenant-a"); len(a) != 2 || a[0] != "a1" || a[1] != "a2" {
+		t.Fatalf("namespace tenant-a (limit 2) = %v, want [a1 a2]", a)
+	}
+	// Unfiltered spans every namespace.
+	all := map[string]bool{}
+	for _, k := range collect(0, "") {
+		all[k] = true
+	}
+	for _, k := range []string{"a1", "a2", "a3", "b1", "u1"} {
+		if !all[k] {
+			t.Fatalf("unfiltered sweep missing %s: %v", k, all)
+		}
 	}
 }
 
@@ -418,7 +465,7 @@ func TestOpen_HappyPath(t *testing.T) {
 	})
 
 	// Store is functional end-to-end.
-	if err := store.RecordAsSent(ctx, "k1", "hash-A"); err != nil {
+	if err := store.RecordAsSent(ctx, "k1", "", "hash-A"); err != nil {
 		t.Fatalf("RecordAsSent: %v", err)
 	}
 	entry, err := store.ReadEntry(ctx, "k1")
@@ -491,7 +538,7 @@ func TestStore_PeakHighWaterMarks(t *testing.T) {
 	s := newStore(t, 25*time.Hour, WithMaxSendTimes(50))
 	ctx := context.Background()
 
-	_ = s.RecordAsSent(ctx, "k1", "h")
+	_ = s.RecordAsSent(ctx, "k1", "", "h")
 	met, _, _ := s.ReadMetrics(ctx, "k1")
 	if met.Peak1h != 1 || met.Peak24h != 1 {
 		t.Fatalf("after 1 send: Peak1h=%d Peak24h=%d, want 1/1", met.Peak1h, met.Peak24h)
@@ -504,7 +551,7 @@ func TestStore_PeakHighWaterMarks(t *testing.T) {
 	}
 
 	for range 4 {
-		_ = s.RecordAsSent(ctx, "k1", "h")
+		_ = s.RecordAsSent(ctx, "k1", "", "h")
 	}
 	met, _, _ = s.ReadMetrics(ctx, "k1")
 	if met.TotalSent != 5 {
@@ -526,7 +573,7 @@ func TestStore_PeakFreezesWhenWindowCountPlateaus(t *testing.T) {
 	// 2ms gaps keep timestamps strictly ordered after BSON's millisecond
 	// truncation.
 	for range 6 {
-		_ = s.RecordAsSent(ctx, "k1", "h")
+		_ = s.RecordAsSent(ctx, "k1", "", "h")
 		time.Sleep(2 * time.Millisecond)
 	}
 
@@ -554,7 +601,7 @@ func TestStore_PeaksSkippedAtDedupeFloor(t *testing.T) {
 	ctx := context.Background()
 
 	for range 5 {
-		_ = s.RecordAsSent(ctx, "k1", "h")
+		_ = s.RecordAsSent(ctx, "k1", "", "h")
 	}
 
 	met, _, _ := s.ReadMetrics(ctx, "k1")
@@ -579,7 +626,7 @@ func TestStore_PeakSkippedWhenTTLBelowWindow(t *testing.T) {
 	ctx := context.Background()
 
 	for range 3 {
-		_ = s.RecordAsSent(ctx, "k1", "h")
+		_ = s.RecordAsSent(ctx, "k1", "", "h")
 	}
 
 	met, _, _ := s.ReadMetrics(ctx, "k1")

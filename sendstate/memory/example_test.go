@@ -57,7 +57,7 @@ func Example_contentHashDedupe() {
 			return
 		}
 		fmt.Printf("send: %s raised=%v\n", scope, body["raised"])
-		_ = store.RecordAsSent(ctx, scope, content)
+		_ = store.RecordAsSent(ctx, scope, "", content)
 	}
 
 	// First call for this scope+content: recorded.

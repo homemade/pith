@@ -23,23 +23,24 @@ func TestNewWriteProtector(t *testing.T) {
 		coalesce.NewLeadingEdgeDebounce(debounce),
 	)
 	ctx := context.Background()
+	w := p.Namespace("") // whole-store namespace; gating happens on the handle
 	meta := protect.RequestMeta{TargetKey: "k1"}
 
 	// First Check proceeds (no prior send).
-	if out := p.Check(ctx, meta, "h1"); out.Decision != protect.DecisionProceed {
+	if out := w.Check(ctx, meta, "h1"); out.Decision != protect.DecisionProceed {
 		t.Fatalf("first Check = %s, want Proceed", out.Decision)
 	}
-	if err := p.RecordAsSent(ctx, meta, "h1"); err != nil {
+	if err := w.RecordAsSent(ctx, meta, "h1"); err != nil {
 		t.Fatalf("RecordAsSent: %v", err)
 	}
 
 	// Identical content → dedupe suppresses.
-	if out := p.Check(ctx, meta, "h1"); out.Decision != protect.DecisionDeduped {
+	if out := w.Check(ctx, meta, "h1"); out.Decision != protect.DecisionDeduped {
 		t.Fatalf("repeat Check = %s, want Deduped", out.Decision)
 	}
 
 	// New content within the window → debounce defers.
-	if out := p.Check(ctx, meta, "h2"); out.Decision != protect.DecisionDeferred {
+	if out := w.Check(ctx, meta, "h2"); out.Decision != protect.DecisionDeferred {
 		t.Fatalf("new-content Check = %s, want Deferred (debounce)", out.Decision)
 	}
 }
@@ -54,25 +55,26 @@ func TestNewReadProtector(t *testing.T) {
 		coalesce.NewLeadingEdgeDebounce(debounce),
 	)
 	ctx := context.Background()
+	r := p.Namespace("") // whole-store namespace; gating happens on the handle
 	meta := protect.RequestMeta{TargetKey: "k1", MessageRef: []byte("ref-1")}
 
 	// First Check proceeds.
-	if out := p.Check(ctx, meta); out.Decision != protect.DecisionProceed {
+	if out := r.Check(ctx, meta); out.Decision != protect.DecisionProceed {
 		t.Fatalf("first Check = %s, want Proceed", out.Decision)
 	}
-	if err := p.RecordAsSent(ctx, meta); err != nil {
+	if err := r.RecordAsSent(ctx, meta); err != nil {
 		t.Fatalf("RecordAsSent: %v", err)
 	}
 
 	// Within the window → deferred (a cap suppression is replayable, not lost).
-	if out := p.Check(ctx, meta); out.Decision != protect.DecisionDeferred {
+	if out := r.Check(ctx, meta); out.Decision != protect.DecisionDeferred {
 		t.Fatalf("repeat Check = %s, want Deferred", out.Decision)
 	}
 
 	// The deferral left a breadcrumb; once the window clears it is a replay
 	// candidate (re-derived from MessageRef, re-read against current state).
 	time.Sleep(2 * debounce)
-	cands, err := p.ReplayCandidates(ctx, 0)
+	cands, err := r.ReplayCandidates(ctx, 0)
 	if err != nil {
 		t.Fatalf("ReplayCandidates: %v", err)
 	}

@@ -123,17 +123,18 @@ func TestNewWriteProtector_AutoDerivesMaxSendTimesFromCoalescers(t *testing.T) {
 	})
 
 	// Functional check: a Check + RecordAsSent round-trip works.
+	w := p.Namespace("") // whole-store namespace; gating happens on the handle
 	meta := protect.RequestMeta{TargetKey: "k1"}
-	if out := p.Check(ctx, meta, "h1"); out.Decision != protect.DecisionProceed || out.Err != nil {
+	if out := w.Check(ctx, meta, "h1"); out.Decision != protect.DecisionProceed || out.Err != nil {
 		t.Fatalf("first Check = %s, err=%v; want Proceed", out.Decision, out.Err)
 	}
-	if err := p.RecordAsSent(ctx, meta, "h1"); err != nil {
+	if err := w.RecordAsSent(ctx, meta, "h1"); err != nil {
 		t.Fatalf("RecordAsSent: %v", err)
 	}
 
 	// Identical content → dedupe trips. Confirms the protector and store
 	// are wired up end-to-end.
-	if out := p.Check(ctx, meta, "h1"); out.Decision != protect.DecisionDeduped {
+	if out := w.Check(ctx, meta, "h1"); out.Decision != protect.DecisionDeduped {
 		t.Fatalf("repeat Check = %s, want Deduped", out.Decision)
 	}
 }
@@ -162,21 +163,22 @@ func TestNewReadProtector_DefersAtCap(t *testing.T) {
 		_ = client.Disconnect(context.Background())
 	})
 
+	rn := r.Namespace("") // whole-store namespace; gating happens on the handle
 	meta := protect.RequestMeta{TargetKey: "r1", MessageRef: []byte("ref-1")}
-	if out := r.Check(ctx, meta); out.Decision != protect.DecisionProceed || out.Err != nil {
+	if out := rn.Check(ctx, meta); out.Decision != protect.DecisionProceed || out.Err != nil {
 		t.Fatalf("first Check = %s, err=%v; want Proceed", out.Decision, out.Err)
 	}
-	if err := r.RecordAsSent(ctx, meta); err != nil {
+	if err := rn.RecordAsSent(ctx, meta); err != nil {
 		t.Fatalf("RecordAsSent: %v", err)
 	}
 	// Quota of 1 is now reached → the next read is DEFERRED (breadcrumb
 	// stamped), not dropped.
-	if out := r.Check(ctx, meta); out.Decision != protect.DecisionDeferred {
+	if out := rn.Check(ctx, meta); out.Decision != protect.DecisionDeferred {
 		t.Fatalf("over-cap Check = %s, want Deferred", out.Decision)
 	}
 	// The deferral is not yet a replay candidate (the 24h quota window has
 	// not cleared) — but the breadcrumb is recorded.
-	cands, err := r.ReplayCandidates(ctx, 0)
+	cands, err := rn.ReplayCandidates(ctx, 0)
 	if err != nil {
 		t.Fatalf("ReplayCandidates: %v", err)
 	}

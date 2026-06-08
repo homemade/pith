@@ -27,7 +27,7 @@ import (
 // recordingProtector (write gate) without the contentHash — a read has no
 // payload to fingerprint.
 type recordingReadProtector struct {
-	inner core.ReadGate
+	inner core.ReadNamespace
 	rec   *sequencerec.Recorder
 }
 
@@ -110,7 +110,7 @@ func TestReadGateScenarios(t *testing.T) {
 		&recordingCap{inner: innerDebounce, rec: rec, name: "Debounce"},
 	)
 	rec.Exit([]any{"core.ReadGate"})
-	pr := &recordingReadProtector{inner: p, rec: rec}
+	pr := &recordingReadProtector{inner: p.Namespace(""), rec: rec}
 
 	rec.Run(t, scenario1, func(t *testing.T) {
 		meta := core.RequestMeta{TargetKey: "campaign-1:webhooks:profile-1", MessageRef: []byte("profile-1@v1")}

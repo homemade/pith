@@ -77,16 +77,25 @@
 //
 // # Replay scope
 //
-// A replay sweep ([ReadProtector.ReplayCandidates] /
-// [WriteProtector.ReplayCandidates]) enumerates the WHOLE store; it cannot
-// be scoped to a subset of keys. TargetKey addresses Check / RecordAsSent —
-// it does not partition the sweep. So two logically independent streams that
-// each defer-and-replay must live in SEPARATE stores (a distinct Database in
-// the [pith/protect/mongodb] factory), never one store distinguished by key
-// prefix. Sharing a store lets one stream's sweep drain and resolve the
-// other's pending deferrals — re-deriving and re-emitting them through the
-// wrong consumer. The collection boundary is the only replay isolation pith
-// offers; partition by store, not by key.
+// A replay sweep ([ReadNamespace.ReplayCandidates] /
+// [WriteNamespace.ReplayCandidates]) enumerates the WHOLE store within the
+// handle's namespace; TargetKey addresses Check / RecordAsSent, not the sweep.
+// There are two separation tools, for two different needs:
+//
+//   - SEPARATE STORES (a distinct Database in the [pith/protect/mongodb]
+//     factory) for streams that replay through DIFFERENT consumers. Sharing a
+//     store here lets one stream's sweep drain and resolve the other's pending
+//     deferrals — re-deriving and re-emitting them through the wrong consumer.
+//     Never split such streams by key prefix; the collection boundary is the
+//     only isolation that keeps their replay logic apart.
+//
+//   - NAMESPACES (pick one with Namespace(ns)) for many streams with the SAME
+//     consumer that share a store but must be swept fairly — e.g. one namespace
+//     per tenant. A namespace-scoped sweep applies limit and the oldest-first
+//     ordering within the namespace, so one tenant's backlog can't
+//     head-of-line-block another's. It narrows only along the namespace axis;
+//     it is not a substitute for separate stores across consumers. The ""
+//     namespace is the whole store.
 //
 // # Construction
 //
@@ -116,15 +125,16 @@
 //	if err != nil { ... }
 //	defer client.Disconnect(ctx)
 //
+//	w := p.Namespace(tenantID)  // "" for the whole store; here, scope to a tenant
 //	meta := protect.RequestMeta{TargetKey: activityID + ":" + contactID, MessageRef: ref}
-//	out := p.Check(ctx, meta, contentHash)
+//	out := w.Check(ctx, meta, contentHash)
 //	if out.Err != nil {
 //	    log.Printf("pith.Check: %v", out.Err) // fail-open; Decision is still actionable
 //	}
 //	switch out.Decision {
 //	case protect.DecisionProceed:
 //	    if err := svc.Send(...); err == nil {
-//	        _ = p.RecordAsSent(ctx, meta, contentHash) // record-on-success
+//	        _ = w.RecordAsSent(ctx, meta, contentHash) // record-on-success
 //	    }
 //	case protect.DecisionDeduped:
 //	    // identical content to the last send; drop.
@@ -135,6 +145,7 @@
 // A read gate is the same shape without the hash and with no Deduped arm —
 // a capped read defers (and a sweep replays it) rather than dropping:
 //
+//	r := readProtector.Namespace(tenantID)
 //	out := r.Check(ctx, meta)
 //	switch out.Decision {
 //	case protect.DecisionProceed:
@@ -155,8 +166,8 @@
 // to store the request's MessageRef and append to LastNDeferredTimes. A
 // consumer-side sweep scans for entries with a pending deferral (most
 // recent deferral newer than the most recent send), re-derives from
-// MessageRef, and re-emits via Check; [WriteProtector.ReplayCandidates] /
-// [ReadProtector.ReplayCandidates] yield the ones whose caps now have room.
+// MessageRef, and re-emits via Check; [WriteNamespace.ReplayCandidates] /
+// [ReadNamespace.ReplayCandidates] yield the ones whose caps now have room.
 // A write sweep re-emits the stashed payload; a read sweep re-fetches
 // current state. A successful RecordAsSent makes the send the most recent
 // event, so the entry is no longer pending — recency alone resolves it.

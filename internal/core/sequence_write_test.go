@@ -29,7 +29,7 @@ import (
 // call is bracketed with Enter/Exit so the gate's activation bar spans
 // the collaborator calls it makes inside.
 type recordingProtector struct {
-	inner core.WriteGate
+	inner core.WriteNamespace
 	rec   *sequencerec.Recorder
 }
 
@@ -113,13 +113,13 @@ func (r *recordingSendStore) ReadMetrics(ctx context.Context, key string) (sends
 	return met, ok, err
 }
 
-func (r *recordingSendStore) RangeDeferred(ctx context.Context, limit int, fn func(key string, e sendstate.Entry) bool) error {
+func (r *recordingSendStore) RangeDeferred(ctx context.Context, limit int, partition string, fn func(key string, e sendstate.Entry) bool) error {
 	// Enter before delegating so the scan's activation bar spans the
 	// per-entry cap checks the callback drives; Exit after so the
 	// return arrow follows them. MemoryStore.RangeDeferred never
 	// errors, so the recorded return is nil.
 	r.rec.Enter("Protector", "Store", "RangeDeferred", []any{limit})
-	err := r.inner.RangeDeferred(ctx, limit, func(key string, e sendstate.Entry) bool {
+	err := r.inner.RangeDeferred(ctx, limit, partition, func(key string, e sendstate.Entry) bool {
 		r.rec.NoteOver("Protector", fmt.Sprintf("examine %s", key))
 		keep := fn(key, e) // runs the gate's capsClear → records the ShouldDefer arrows
 		if r.capsClear != nil {
@@ -135,14 +135,14 @@ func (r *recordingSendStore) RangeDeferred(ctx context.Context, limit int, fn fu
 	return err
 }
 
-func (r *recordingSendStore) RecordAsSent(ctx context.Context, key, contentHash string) error {
-	err := r.inner.RecordAsSent(ctx, key, contentHash)
+func (r *recordingSendStore) RecordAsSent(ctx context.Context, key, namespace, contentHash string) error {
+	err := r.inner.RecordAsSent(ctx, key, namespace, contentHash)
 	r.rec.RecordCall("Protector", "Store", "RecordAsSent", []any{key, contentHash}, []any{err})
 	return err
 }
 
-func (r *recordingSendStore) RecordAsDeferred(ctx context.Context, key string, messageRef []byte) error {
-	err := r.inner.RecordAsDeferred(ctx, key, messageRef)
+func (r *recordingSendStore) RecordAsDeferred(ctx context.Context, key, partition string, messageRef []byte) error {
+	err := r.inner.RecordAsDeferred(ctx, key, partition, messageRef)
 	r.rec.RecordCall("Protector", "Store", "RecordAsDeferred", []any{key, fmt.Sprintf("<%d bytes>", len(messageRef))}, []any{err})
 	return err
 }
@@ -214,7 +214,7 @@ func TestWriteGateScenarios(t *testing.T) {
 		&recordingCap{inner: innerQuota, rec: rec, name: "Quota"},
 	)
 	rec.Exit([]any{"core.WriteGate"})
-	pr := &recordingProtector{inner: p, rec: rec}
+	pr := &recordingProtector{inner: p.Namespace(""), rec: rec}
 
 	rec.Run(t, scenario1, func(t *testing.T) {
 		meta := core.RequestMeta{TargetKey: "act-1:contact-1", MessageRef: []byte("activity-A")}
@@ -288,8 +288,8 @@ func TestWriteGateScenarios(t *testing.T) {
 		// outside the debounce window — the debounce ShouldDefer
 		// will return false (no recent send), so the diagram shows
 		// debounce checking and clearing before quota trips.
-		_ = innerStore.RecordAsSent(ctx, "act-1:contact-3", "setup-1")
-		_ = innerStore.RecordAsSent(ctx, "act-1:contact-3", "setup-2")
+		_ = innerStore.RecordAsSent(ctx, "act-1:contact-3", "", "setup-1")
+		_ = innerStore.RecordAsSent(ctx, "act-1:contact-3", "", "setup-2")
 		time.Sleep(2 * debounceWindow)
 
 		meta := core.RequestMeta{TargetKey: "act-1:contact-3", MessageRef: []byte("activity-C")}

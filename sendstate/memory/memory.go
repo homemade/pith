@@ -57,10 +57,14 @@ func (m *Store) maxSendTimes() int {
 }
 
 // entryRecord is the stored Entry plus its TTL field — the in-memory
-// mirror of an Entry-collection document (Entry fields + expireAt).
+// mirror of an Entry-collection document (Entry fields + expireAt +
+// namespace). namespace is the sweep-scoping token stamped by
+// RecordAsDeferred and carried forward untouched by RecordAsSent;
+// RangeDeferred filters on it.
 type entryRecord struct {
-	entry    sendstate.Entry
-	expireAt time.Time
+	entry     sendstate.Entry
+	expireAt  time.Time
+	namespace string
 }
 
 // New returns a Store whose entries expire entryTTL after their last
@@ -91,12 +95,12 @@ func (m *Store) GrowMaxSendTimes(n int) {
 }
 
 // RecordAsSent appends a send timestamp (bounded to the most recent
-// maxSendTimes() entries), refreshes the Entry TTL, and advances the
-// lifetime metrics. It touches only send-side state — the deferred
-// ref and LastNDeferredTimes are preserved; the newer send timestamp
+// maxSendTimes() entries), refreshes the Entry TTL, stamps the namespace,
+// and advances the lifetime metrics. It touches only send-side state — the
+// deferred ref and LastNDeferredTimes are preserved; the newer send timestamp
 // is what makes any prior deferral no longer pending. The documented
 // race with concurrent RecordAsDeferred is accepted.
-func (m *Store) RecordAsSent(_ context.Context, key, contentHash string) error {
+func (m *Store) RecordAsSent(_ context.Context, key, namespace, contentHash string) error {
 	now := time.Now()
 	expireAt := now.Add(m.ttl)
 
@@ -126,8 +130,9 @@ func (m *Store) RecordAsSent(_ context.Context, key, contentHash string) error {
 		v, ok := m.entries.Load(key)
 		if !ok {
 			fresh := &entryRecord{
-				entry:    sendstate.Entry{ContentHash: contentHash, LastNSendTimes: []time.Time{now}},
-				expireAt: expireAt,
+				entry:     sendstate.Entry{ContentHash: contentHash, LastNSendTimes: []time.Time{now}},
+				expireAt:  expireAt,
+				namespace: namespace,
 			}
 			if _, loaded := m.entries.LoadOrStore(key, fresh); !loaded {
 				if trackPeaks {
@@ -150,7 +155,9 @@ func (m *Store) RecordAsSent(_ context.Context, key, contentHash string) error {
 		}
 		// Deferred-side state is preserved untouched — a send
 		// supersedes a pending deferral by recency (newer send
-		// timestamp), not by clearing the ref or the deferral list.
+		// timestamp), not by clearing the ref or the deferral list. The
+		// namespace is constant per key, so re-stamping the passed value
+		// matches any prior deferral's.
 		next := &entryRecord{
 			entry: sendstate.Entry{
 				ContentHash:            contentHash,
@@ -158,7 +165,8 @@ func (m *Store) RecordAsSent(_ context.Context, key, contentHash string) error {
 				LastNSendTimes:         times,
 				LastNDeferredTimes:     prev.entry.LastNDeferredTimes,
 			},
-			expireAt: expireAt,
+			expireAt:  expireAt,
+			namespace: namespace,
 		}
 		if m.entries.CompareAndSwap(key, prev, next) {
 			if trackPeaks {
@@ -175,6 +183,7 @@ func (m *Store) RecordAsSent(_ context.Context, key, contentHash string) error {
 		v, ok := m.metrics.Load(key)
 		if !ok {
 			fresh := &sendstate.Metrics{
+				Namespace:   namespace,
 				TotalSent:   1,
 				FirstSentAt: now,
 				LastSentAt:  now,
@@ -196,6 +205,7 @@ func (m *Store) RecordAsSent(_ context.Context, key, contentHash string) error {
 		// never cleared; a later send just makes LastSentAt exceed
 		// LastDeferredAt.
 		next := *prev
+		next.Namespace = namespace
 		next.TotalSent = prev.TotalSent + 1
 		next.LastSentAt = now
 		// FirstSentAt is set-once. The metrics doc could have been
@@ -228,10 +238,11 @@ func (m *Store) RecordAsSent(_ context.Context, key, contentHash string) error {
 
 // RecordAsDeferred sets LastDeferredMessageRef, appends a deferral
 // timestamp to LastNDeferredTimes (bounded like the send list),
-// refreshes the Entry TTL, and advances the deferred-side metrics.
-// Preserves ContentHash and LastNSendTimes. CAS-loops so concurrent
-// calls don't clobber each other's writes.
-func (m *Store) RecordAsDeferred(_ context.Context, key string, messageRef []byte) error {
+// refreshes the Entry TTL, stamps the sweep-scoping namespace, and
+// advances the deferred-side metrics. Preserves ContentHash and
+// LastNSendTimes. CAS-loops so concurrent calls don't clobber each
+// other's writes.
+func (m *Store) RecordAsDeferred(_ context.Context, key, namespace string, messageRef []byte) error {
 	now := time.Now()
 	expireAt := now.Add(m.ttl)
 
@@ -244,7 +255,8 @@ func (m *Store) RecordAsDeferred(_ context.Context, key string, messageRef []byt
 					LastDeferredMessageRef: messageRef,
 					LastNDeferredTimes:     []time.Time{now},
 				},
-				expireAt: expireAt,
+				expireAt:  expireAt,
+				namespace: namespace,
 			}
 			if _, loaded := m.entries.LoadOrStore(key, fresh); !loaded {
 				break
@@ -263,7 +275,8 @@ func (m *Store) RecordAsDeferred(_ context.Context, key string, messageRef []byt
 				LastNSendTimes:         prev.entry.LastNSendTimes,
 				LastNDeferredTimes:     dtimes,
 			},
-			expireAt: expireAt,
+			expireAt:  expireAt,
+			namespace: namespace,
 		}
 		if m.entries.CompareAndSwap(key, prev, next) {
 			break
@@ -275,6 +288,7 @@ func (m *Store) RecordAsDeferred(_ context.Context, key string, messageRef []byt
 		v, ok := m.metrics.Load(key)
 		if !ok {
 			fresh := &sendstate.Metrics{
+				Namespace:       namespace,
 				TotalDeferred:   1,
 				FirstDeferredAt: now,
 				LastDeferredAt:  now,
@@ -286,6 +300,7 @@ func (m *Store) RecordAsDeferred(_ context.Context, key string, messageRef []byt
 		}
 		prev := v.(*sendstate.Metrics)
 		next := *prev
+		next.Namespace = namespace
 		next.TotalDeferred = prev.TotalDeferred + 1
 		next.LastDeferredAt = now
 		// FirstDeferredAt is set-once — symmetric with the send side
@@ -330,8 +345,10 @@ func (m *Store) ReadMetrics(_ context.Context, key string) (sendstate.Metrics, b
 
 // RangeDeferred visits pending entries (most recent deferral newer
 // than most recent send) oldest-pending first, skipping TTL-expired
-// records, up to limit (<= 0 = unbounded).
-func (m *Store) RangeDeferred(_ context.Context, limit int, fn func(key string, e sendstate.Entry) bool) error {
+// records, up to limit (<= 0 = unbounded). When namespace is non-empty
+// only entries stamped with it are visited (so limit applies within the
+// namespace); "" visits every namespace.
+func (m *Store) RangeDeferred(_ context.Context, limit int, namespace string, fn func(key string, e sendstate.Entry) bool) error {
 	now := time.Now()
 
 	type pendingKey struct {
@@ -345,6 +362,9 @@ func (m *Store) RangeDeferred(_ context.Context, limit int, fn func(key string, 
 		r := v.(*entryRecord)
 		if !r.expireAt.After(now) {
 			return true // expired; reads as absent
+		}
+		if namespace != "" && r.namespace != namespace {
+			return true // out of the requested namespace's scope
 		}
 		deferredAt := r.entry.LastDeferredTime()
 		if !deferredAt.After(r.entry.LastSentTime()) {

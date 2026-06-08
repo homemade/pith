@@ -215,6 +215,14 @@ func countInWindow(times []time.Time, now time.Time, window time.Duration) int {
 //	    rate := float64(met.TotalSent) / span.Hours()
 //	}
 type Metrics struct {
+	// Namespace is the sweep-scoping token this key belongs to (the
+	// caller-defined value bound on the protector's namespace handle; ""
+	// = the whole store). Stamped on every [Store.RecordAsSent] /
+	// [Store.RecordAsDeferred], so it is present even for a send-only key.
+	// Constant per key. Lets observability group/filter lifetime metrics by
+	// namespace (e.g. per-tenant cap-pressure) without parsing the key.
+	Namespace string
+
 	// TotalSent is the lifetime count of [Store.RecordAsSent] calls
 	// for this key.
 	TotalSent uint64
@@ -288,14 +296,23 @@ type Store interface {
 	// only send-side state — the deferred breadcrumb,
 	// LastNDeferredTimes, and LastDeferredAt are all left intact; the
 	// newer send timestamp is what makes a prior deferral no longer
-	// pending.
-	RecordAsSent(ctx context.Context, key, contentHash string) error
+	// pending. It also stamps namespace (the caller-defined token bound
+	// on the protector's namespace handle; "" = the whole store) on both
+	// the entry and the [Metrics] doc, so a send-only key — one never
+	// deferred — still carries its namespace for per-namespace metrics
+	// queries.
+	RecordAsSent(ctx context.Context, key, namespace, contentHash string) error
 
 	// RecordAsDeferred sets LastDeferredMessageRef, appends a
 	// timestamp to LastNDeferredTimes, refreshes the Entry TTL,
 	// increments TotalDeferred, and stamps LastDeferredAt. Does not
-	// touch ContentHash, LastSentAt, or LastNSendTimes.
-	RecordAsDeferred(ctx context.Context, key string, messageRef []byte) error
+	// touch ContentHash, LastSentAt, or LastNSendTimes. It also stamps
+	// namespace (the caller-defined sweep-scoping token bound on the
+	// protector's namespace handle; "" = the whole store) on the entry —
+	// so [Store.RangeDeferred] can filter to it — and on the [Metrics] doc.
+	// The namespace is constant per key, so its value is stable across
+	// sends and re-deferrals.
+	RecordAsDeferred(ctx context.Context, key, namespace string, messageRef []byte) error
 
 	// ReadEntry returns the key's working [Entry]. Two distinct cases
 	// both return the zero Entry, distinguishable by err:
@@ -329,9 +346,17 @@ type Store interface {
 	// read as absent). At most limit records are visited (limit <= 0
 	// means no bound); fn returns false to stop early.
 	//
+	// namespace scopes the sweep: when non-empty, only entries whose
+	// stored namespace equals it are visited, so limit (and the
+	// oldest-pending ordering) apply within that namespace rather than
+	// across the whole store. Empty means visit every namespace. This is
+	// what lets independent streams share one store yet be swept fairly —
+	// without it, one namespace's oldest-pending backlog would consume the
+	// limit budget of every sweep.
+	//
 	// fn does the consumer-specific work — re-derive the payload from
 	// the ref, re-emit via Check, and on a successful send RecordAsSent
 	// (recency then makes the key no longer pending). pith provides no
 	// orchestration beyond this enumeration.
-	RangeDeferred(ctx context.Context, limit int, fn func(key string, e Entry) bool) error
+	RangeDeferred(ctx context.Context, limit int, namespace string, fn func(key string, e Entry) bool) error
 }

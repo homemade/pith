@@ -9,14 +9,14 @@
 // consults the deferral cadence ([pith/sendstate.Entry.CountDeferredInWindow]),
 // so a sustained burst stays deferred until it goes quiet and then fires
 // once more — the final state. It is meaningful only on a gate that stamps
-// deferrals and is swept (see [pith/protect.ReadProtector]).
+// deferrals and is swept (see [pith/protect.ReadNamespace]).
 //
 // Coalescer is a read-only policy: a pure function over a
 // pre-fetched [pith/sendstate.Entry]. It answers "does this entry
 // hold hardCap or more successful sends within the trailing window?"
 // The caller owns the entry read — typically one shared read fed to
 // dedupe and every attached Coalescer (see
-// [pith/protect.Protector.Check]) — and writes (recording a
+// [pith/protect.WriteNamespace.Check]) — and writes (recording a
 // successful send) go through [pith/sendstate.Store.RecordAsSent].
 //
 // The (hardCap, window) pair is supplied once at construction —

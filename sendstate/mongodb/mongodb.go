@@ -55,6 +55,7 @@ type entryDoc struct {
 	LastNDeferredTimes     []time.Time `bson:"lastNDeferredTimes,omitempty"`
 	LastSentAt             time.Time   `bson:"lastSentAt,omitempty"`
 	LastDeferredAt         time.Time   `bson:"lastDeferredAt,omitempty"`
+	Namespace              string      `bson:"namespace,omitempty"`
 	ExpireAt               time.Time   `bson:"expireAt"`
 }
 
@@ -70,6 +71,7 @@ func (d entryDoc) entry() sendstate.Entry {
 // metricsDoc is the metrics-collection document — the lifetime rollup.
 type metricsDoc struct {
 	Key             string    `bson:"_id"`
+	Namespace       string    `bson:"namespace,omitempty"`
 	TotalSent       uint64    `bson:"totalSent"`
 	TotalDeferred   uint64    `bson:"totalDeferred"`
 	FirstSentAt     time.Time `bson:"firstSentAt,omitempty"`
@@ -84,6 +86,7 @@ type metricsDoc struct {
 
 func (d metricsDoc) metrics() sendstate.Metrics {
 	return sendstate.Metrics{
+		Namespace:       d.Namespace,
 		TotalSent:       d.TotalSent,
 		TotalDeferred:   d.TotalDeferred,
 		FirstSentAt:     d.FirstSentAt,
@@ -251,8 +254,9 @@ func Open(ctx context.Context, cfg Config) (*Store, *mongo.Client, error) {
 	return store, client, nil
 }
 
-// EnsureIndexes creates the TTL index on expireAt and the
-// lastDeferredAt index that serves [Store.RangeDeferred]'s sort.
+// EnsureIndexes creates the TTL index on expireAt, the lastDeferredAt index
+// that serves an unscoped [Store.RangeDeferred] sort, and the compound
+// {namespace, lastDeferredAt} index that serves a namespace-scoped sort.
 // Idempotent; call once at startup.
 func (s *Store) EnsureIndexes(ctx context.Context) error {
 	_, err := s.entries.Indexes().CreateOne(ctx, mongo.IndexModel{
@@ -262,10 +266,18 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// Serves RangeDeferred's {lastDeferredAt: 1} sort+limit; the pending
-	// $expr predicate is a cheap residual on the bounded scan.
+	// Serves an unscoped RangeDeferred's {lastDeferredAt: 1} sort+limit;
+	// the pending $expr predicate is a cheap residual on the bounded scan.
 	_, err = s.entries.Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys: bson.D{{Key: "lastDeferredAt", Value: 1}},
+	})
+	if err != nil {
+		return err
+	}
+	// Serves a namespace-scoped RangeDeferred: equality on namespace leads, so
+	// lastDeferredAt still serves the sort+limit within the namespace (ESR).
+	_, err = s.entries.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{{Key: "namespace", Value: 1}, {Key: "lastDeferredAt", Value: 1}},
 	})
 	return err
 }
@@ -280,7 +292,7 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 // Two round-trips: entries update, then metrics update. Eventually
 // consistent across the two collections; only entries drives
 // decisions, so this never affects an answer.
-func (s *Store) RecordAsSent(ctx context.Context, key, contentHash string) error {
+func (s *Store) RecordAsSent(ctx context.Context, key, namespace, contentHash string) error {
 	now := time.Now()
 
 	// Dedupe-only floor: at maxSendTimes == 1 the send-time list holds a
@@ -292,7 +304,7 @@ func (s *Store) RecordAsSent(ctx context.Context, key, contentHash string) error
 	// exactly when the peaks become meaningful.
 	if s.maxSendTimes <= 1 {
 		_, err := s.entries.UpdateByID(ctx, key, bson.M{
-			"$set":  bson.M{"contentHash": contentHash, "lastSentAt": now, "expireAt": now.Add(s.ttl)},
+			"$set":  bson.M{"contentHash": contentHash, "lastSentAt": now, "namespace": namespace, "expireAt": now.Add(s.ttl)},
 			"$push": bson.M{"lastNSendTimes": bson.M{"$each": bson.A{now}, "$slice": -s.maxSendTimes}},
 		}, options.UpdateOne().SetUpsert(true))
 		if err != nil {
@@ -300,7 +312,7 @@ func (s *Store) RecordAsSent(ctx context.Context, key, contentHash string) error
 		}
 		_, err = s.metrics.UpdateByID(ctx, key, bson.M{
 			"$inc": bson.M{"totalSent": 1},
-			"$set": bson.M{"lastSentAt": now},
+			"$set": bson.M{"lastSentAt": now, "namespace": namespace},
 			"$min": bson.M{"firstSentAt": now},
 		}, options.UpdateOne().SetUpsert(true))
 		return err
@@ -311,7 +323,7 @@ func (s *Store) RecordAsSent(ctx context.Context, key, contentHash string) error
 	// below. Same write and round-trip — it just returns the document.
 	var doc entryDoc
 	err := s.entries.FindOneAndUpdate(ctx, bson.M{"_id": key}, bson.M{
-		"$set":  bson.M{"contentHash": contentHash, "lastSentAt": now, "expireAt": now.Add(s.ttl)},
+		"$set":  bson.M{"contentHash": contentHash, "lastSentAt": now, "namespace": namespace, "expireAt": now.Add(s.ttl)},
 		"$push": bson.M{"lastNSendTimes": bson.M{"$each": bson.A{now}, "$slice": -s.maxSendTimes}},
 	}, options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After)).Decode(&doc)
 	if err != nil {
@@ -330,6 +342,7 @@ func (s *Store) RecordAsSent(ctx context.Context, key, contentHash string) error
 	// reader can tell apart from a real 0. (E.g. a 2h-TTL store folds peak1h
 	// but skips peak24h.)
 	set := bson.M{
+		"namespace":   namespace,
 		"totalSent":   bson.M{"$add": bson.A{bson.M{"$ifNull": bson.A{"$totalSent", 0}}, 1}},
 		"lastSentAt":  now,
 		"firstSentAt": bson.M{"$min": bson.A{"$firstSentAt", now}},
@@ -368,14 +381,17 @@ func (s *Store) RecordAsSent(ctx context.Context, key, contentHash string) error
 }
 
 // RecordAsDeferred stamps the breadcrumb, appends the deferral
-// timestamp (and scalar lastDeferredAt tail), and refreshes the TTL —
-// without touching contentHash, lastNSendTimes, or lastSentAt; then
-// bumps the deferred-side counters.
-func (s *Store) RecordAsDeferred(ctx context.Context, key string, messageRef []byte) error {
+// timestamp (and scalar lastDeferredAt tail), stamps the sweep-scoping
+// namespace, and refreshes the TTL — without touching contentHash,
+// lastNSendTimes, or lastSentAt; then bumps the deferred-side counters.
+func (s *Store) RecordAsDeferred(ctx context.Context, key, namespace string, messageRef []byte) error {
 	now := time.Now()
 
+	// namespace is set unconditionally (constant per key, "" leaves it
+	// unscoped). RecordAsSent never writes it, so it survives a send and
+	// stays valid for the next re-deferral.
 	_, err := s.entries.UpdateByID(ctx, key, bson.M{
-		"$set":  bson.M{"lastDeferredMessageRef": messageRef, "lastDeferredAt": now, "expireAt": now.Add(s.ttl)},
+		"$set":  bson.M{"lastDeferredMessageRef": messageRef, "lastDeferredAt": now, "namespace": namespace, "expireAt": now.Add(s.ttl)},
 		"$push": bson.M{"lastNDeferredTimes": bson.M{"$each": bson.A{now}, "$slice": -s.maxSendTimes}},
 	}, options.UpdateOne().SetUpsert(true))
 	if err != nil {
@@ -386,7 +402,7 @@ func (s *Store) RecordAsDeferred(ctx context.Context, key string, messageRef []b
 	// firstSentAt on RecordAsSent. See that method's comment.
 	_, err = s.metrics.UpdateByID(ctx, key, bson.M{
 		"$inc": bson.M{"totalDeferred": 1},
-		"$set": bson.M{"lastDeferredAt": now},
+		"$set": bson.M{"lastDeferredAt": now, "namespace": namespace},
 		"$min": bson.M{"firstDeferredAt": now},
 	}, options.UpdateOne().SetUpsert(true))
 	return err
@@ -428,14 +444,23 @@ func (s *Store) ReadMetrics(ctx context.Context, key string) (sendstate.Metrics,
 // RangeDeferred visits pending entries — most recent deferral newer than
 // most recent send — oldest-pending first, up to limit (<= 0 =
 // unbounded), skipping TTL-expired records. Pending and order both come
-// from the denormalized scalar tails: the {lastDeferredAt: 1} index
-// serves the sort+limit and the $expr is a cheap residual on the bounded
-// scan. A doc that has only ever been deferred has no lastSentAt (null),
-// which sorts below any date, so it reads as pending.
-func (s *Store) RangeDeferred(ctx context.Context, limit int, fn func(key string, e sendstate.Entry) bool) error {
+// from the denormalized scalar tails. A doc that has only ever been
+// deferred has no lastSentAt (null), which sorts below any date, so it
+// reads as pending.
+//
+// When namespace is non-empty an equality predicate on namespace is added,
+// scoping the sweep to that namespace — the {namespace, lastDeferredAt}
+// compound index then serves the equality + sort + limit in one scan (limit
+// applies within the namespace). When empty, the whole store is visited and
+// the {lastDeferredAt: 1} index serves the sort. The $expr pending predicate
+// is a cheap residual on the bounded scan either way.
+func (s *Store) RangeDeferred(ctx context.Context, limit int, namespace string, fn func(key string, e sendstate.Entry) bool) error {
 	filter := bson.M{
 		"expireAt": bson.M{"$gt": time.Now()},                               // TTL-honoring
 		"$expr":    bson.M{"$gt": bson.A{"$lastDeferredAt", "$lastSentAt"}}, // pending
+	}
+	if namespace != "" {
+		filter["namespace"] = namespace // sweep-scoping: only this namespace's pending entries
 	}
 	opts := options.Find().SetSort(bson.D{{Key: "lastDeferredAt", Value: 1}}) // oldest first
 	if limit > 0 {

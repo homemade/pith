@@ -25,13 +25,13 @@ func (f *failingStore) ReadEntry(context.Context, string) (sendstate.Entry, erro
 func (f *failingStore) ReadMetrics(context.Context, string) (sendstate.Metrics, bool, error) {
 	return sendstate.Metrics{}, false, nil
 }
-func (f *failingStore) RecordAsSent(context.Context, string, string) error {
+func (f *failingStore) RecordAsSent(context.Context, string, string, string) error {
 	return nil
 }
-func (f *failingStore) RecordAsDeferred(context.Context, string, []byte) error {
+func (f *failingStore) RecordAsDeferred(context.Context, string, string, []byte) error {
 	return nil
 }
-func (f *failingStore) RangeDeferred(context.Context, int, func(string, sendstate.Entry) bool) error {
+func (f *failingStore) RangeDeferred(context.Context, int, string, func(string, sendstate.Entry) bool) error {
 	return nil
 }
 
@@ -45,7 +45,7 @@ func TestGate_Check_FailsOpenOnReadEntryError(t *testing.T) {
 	wantErr := errors.New("simulated store outage")
 	w := core.NewWrite(&failingStore{readErr: wantErr}, coalesce.NewQuota(1, time.Hour))
 
-	out := w.Check(context.Background(), core.RequestMeta{TargetKey: "k1"}, "h1")
+	out := w.Namespace("").Check(context.Background(), core.RequestMeta{TargetKey: "k1"}, "h1")
 
 	if !errors.Is(out.Err, wantErr) {
 		t.Fatalf("Outcome.Err = %v, want to wrap %v", out.Err, wantErr)
