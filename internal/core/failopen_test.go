@@ -8,6 +8,7 @@ import (
 
 	"github.com/homemade/pith/coalesce"
 	"github.com/homemade/pith/internal/core"
+	"github.com/homemade/pith/protect"
 	"github.com/homemade/pith/sendstate"
 )
 
@@ -45,12 +46,12 @@ func TestGate_Check_FailsOpenOnReadEntryError(t *testing.T) {
 	wantErr := errors.New("simulated store outage")
 	w := core.NewWrite(&failingStore{readErr: wantErr}, coalesce.NewQuota(1, time.Hour))
 
-	out := w.Namespace("").Check(context.Background(), core.RequestMeta{TargetKey: "k1"}, "h1")
+	out := w.Namespace("").Check(context.Background(), protect.RequestMeta{TargetKey: "k1"}, "h1")
 
 	if !errors.Is(out.Err, wantErr) {
 		t.Fatalf("Outcome.Err = %v, want to wrap %v", out.Err, wantErr)
 	}
-	if out.Decision != core.DecisionProceed {
+	if out.Decision != protect.DecisionProceed {
 		t.Fatalf("Outcome.Decision = %s, want DecisionProceed (fail-open)", out.Decision)
 	}
 	if out.Reason != "" {

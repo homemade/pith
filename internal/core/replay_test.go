@@ -7,6 +7,7 @@ import (
 
 	"github.com/homemade/pith/coalesce"
 	"github.com/homemade/pith/internal/core"
+	"github.com/homemade/pith/protect"
 	"github.com/homemade/pith/sendstate/memory"
 )
 
@@ -19,16 +20,16 @@ func TestWriteGate_ReplayCandidates(t *testing.T) {
 		memory.New(time.Hour),
 		coalesce.NewLeadingEdgeDebounce(debounce),
 	).Namespace("") // whole-store namespace; gating happens on the handle
-	meta := core.RequestMeta{TargetKey: "k1", MessageRef: []byte("ref")}
+	meta := protect.RequestMeta{TargetKey: "k1", MessageRef: []byte("ref")}
 
 	// First send proceeds and is recorded.
-	if out := w.Check(ctx, meta, "h1"); out.Decision != core.DecisionProceed {
+	if out := w.Check(ctx, meta, "h1"); out.Decision != protect.DecisionProceed {
 		t.Fatalf("first Check should proceed, got %s", out.Decision)
 	}
 	_ = w.RecordAsSent(ctx, meta, "h1")
 
 	// Second (new content) within the window → debounce defers → pending.
-	if out := w.Check(ctx, meta, "h2"); out.Decision != core.DecisionDeferred {
+	if out := w.Check(ctx, meta, "h2"); out.Decision != protect.DecisionDeferred {
 		t.Fatalf("second Check should defer (debounce), got %s", out.Decision)
 	}
 

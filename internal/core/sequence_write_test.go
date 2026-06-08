@@ -9,6 +9,7 @@ import (
 
 	"github.com/homemade/pith/coalesce"
 	"github.com/homemade/pith/internal/core"
+	"github.com/homemade/pith/protect"
 	"github.com/homemade/pith/sendstate"
 	"github.com/homemade/pith/sendstate/memory"
 	"github.com/joineduptech/doc/sequencerec"
@@ -29,25 +30,25 @@ import (
 // call is bracketed with Enter/Exit so the gate's activation bar spans
 // the collaborator calls it makes inside.
 type recordingProtector struct {
-	inner core.WriteNamespace
+	inner protect.WriteNamespace
 	rec   *sequencerec.Recorder
 }
 
-func (w *recordingProtector) Check(ctx context.Context, meta core.RequestMeta, contentHash string) core.Outcome {
+func (w *recordingProtector) Check(ctx context.Context, meta protect.RequestMeta, contentHash string) protect.Outcome {
 	w.rec.Enter("Client", "Protector", "Check", nil)
 	out := w.inner.Check(ctx, meta, contentHash)
 	w.rec.Exit([]any{outcomeLabel(out)})
 	return out
 }
 
-func (w *recordingProtector) RecordAsSent(ctx context.Context, meta core.RequestMeta, contentHash string) error {
+func (w *recordingProtector) RecordAsSent(ctx context.Context, meta protect.RequestMeta, contentHash string) error {
 	w.rec.Enter("Client", "Protector", "RecordAsSent", nil)
 	err := w.inner.RecordAsSent(ctx, meta, contentHash)
 	w.rec.Exit([]any{err})
 	return err
 }
 
-func (w *recordingProtector) ReplayCandidates(ctx context.Context, limit int) ([]core.DeferredRequest, error) {
+func (w *recordingProtector) ReplayCandidates(ctx context.Context, limit int) ([]protect.DeferredRequest, error) {
 	w.rec.Enter("Client", "Protector", "ReplayCandidates", []any{limit})
 	ready, err := w.inner.ReplayCandidates(ctx, limit)
 	w.rec.Exit([]any{fmt.Sprintf("%d DeferredRequest", len(ready))})
@@ -57,7 +58,7 @@ func (w *recordingProtector) ReplayCandidates(ctx context.Context, limit int) ([
 // outcomeLabel renders a Check outcome as a single return value,
 // folding the deferral Reason in so the diagram shows which mechanism
 // fired without a separate arrow.
-func outcomeLabel(out core.Outcome) string {
+func outcomeLabel(out protect.Outcome) string {
 	if out.Reason != "" {
 		return fmt.Sprintf("%s (%s)", out.Decision, out.Reason)
 	}
@@ -217,14 +218,14 @@ func TestWriteGateScenarios(t *testing.T) {
 	pr := &recordingProtector{inner: p.Namespace(""), rec: rec}
 
 	rec.Run(t, scenario1, func(t *testing.T) {
-		meta := core.RequestMeta{TargetKey: "act-1:contact-1", MessageRef: []byte("activity-A")}
+		meta := protect.RequestMeta{TargetKey: "act-1:contact-1", MessageRef: []byte("activity-A")}
 		const hash = "hash-A"
 		rec.Note("Check(content=hash-A, target=act-1:contact-1)")
 		out := pr.Check(ctx, meta, hash)
 		if out.Err != nil {
 			t.Fatalf("Check: %v", out.Err)
 		}
-		if out.Decision != core.DecisionProceed {
+		if out.Decision != protect.DecisionProceed {
 			t.Fatalf("want Proceed, got %s", out.Decision)
 		}
 		rec.Note(fmt.Sprintf("→ %s", out.Decision))
@@ -251,28 +252,28 @@ func TestWriteGateScenarios(t *testing.T) {
 	})
 
 	rec.Run(t, "duplicate content to the same target is deduped", func(t *testing.T) {
-		meta := core.RequestMeta{TargetKey: "act-1:contact-1", MessageRef: []byte("activity-A-dup")}
+		meta := protect.RequestMeta{TargetKey: "act-1:contact-1", MessageRef: []byte("activity-A-dup")}
 		const hash = "hash-A" // same content as scenario 1
 		rec.Note("Check(content=hash-A, target=act-1:contact-1)")
 		out := pr.Check(ctx, meta, hash)
 		if out.Err != nil {
 			t.Fatalf("Check: %v", out.Err)
 		}
-		if out.Decision != core.DecisionDeduped {
+		if out.Decision != protect.DecisionDeduped {
 			t.Fatalf("want Deduped, got %s", out.Decision)
 		}
 		rec.Note(fmt.Sprintf("→ %s (%s) — no breadcrumb stamped", out.Decision, out.Reason))
 	})
 
 	rec.Run(t, "same-target follow-up within debounce window is deferred", func(t *testing.T) {
-		meta := core.RequestMeta{TargetKey: "act-1:contact-1", MessageRef: []byte("activity-B")}
+		meta := protect.RequestMeta{TargetKey: "act-1:contact-1", MessageRef: []byte("activity-B")}
 		const hash = "hash-B" // new content
 		rec.Note("Check(content=hash-B, target=act-1:contact-1) — 1 send within debounce window")
 		out := pr.Check(ctx, meta, hash)
 		if out.Err != nil {
 			t.Fatalf("Check: %v", out.Err)
 		}
-		if out.Decision != core.DecisionDeferred {
+		if out.Decision != protect.DecisionDeferred {
 			t.Fatalf("want Deferred, got %s", out.Decision)
 		}
 		if want := "leading-edge debounce 30ms"; out.Reason != want {
@@ -292,14 +293,14 @@ func TestWriteGateScenarios(t *testing.T) {
 		_ = innerStore.RecordAsSent(ctx, "act-1:contact-3", "", "setup-2")
 		time.Sleep(2 * debounceWindow)
 
-		meta := core.RequestMeta{TargetKey: "act-1:contact-3", MessageRef: []byte("activity-C")}
+		meta := protect.RequestMeta{TargetKey: "act-1:contact-3", MessageRef: []byte("activity-C")}
 		const hash = "hash-C"
 		rec.Note("Check(content=hash-C, target=act-1:contact-3) — quota at hardCap=2, debounce window expired")
 		out := pr.Check(ctx, meta, hash)
 		if out.Err != nil {
 			t.Fatalf("Check: %v", out.Err)
 		}
-		if out.Decision != core.DecisionDeferred {
+		if out.Decision != protect.DecisionDeferred {
 			t.Fatalf("want Deferred, got %s", out.Decision)
 		}
 		if want := "quota cap 2 per 24h"; out.Reason != want {
@@ -309,14 +310,14 @@ func TestWriteGateScenarios(t *testing.T) {
 	})
 
 	rec.Run(t, "below-cap send proceeds; RecordAsSent appends to sendstate", func(t *testing.T) {
-		meta := core.RequestMeta{TargetKey: "act-1:contact-4", MessageRef: []byte("activity-D")}
+		meta := protect.RequestMeta{TargetKey: "act-1:contact-4", MessageRef: []byte("activity-D")}
 		const hash = "hash-D"
 		rec.Note("Check(content=hash-D, target=act-1:contact-4) — counts start at 0")
 		out := pr.Check(ctx, meta, hash)
 		if out.Err != nil {
 			t.Fatalf("Check: %v", out.Err)
 		}
-		if out.Decision != core.DecisionProceed {
+		if out.Decision != protect.DecisionProceed {
 			t.Fatalf("want Proceed, got %s", out.Decision)
 		}
 		rec.Note(fmt.Sprintf("→ %s", out.Decision))

@@ -9,6 +9,9 @@
 // stay the two pith ships. The Go internal-package rule makes this
 // structural, not a doc convention.
 //
+// The public value types and gate interfaces are defined in [pith/protect]
+// (a leaf package); core imports them and supplies the only implementation —
+// the concrete gate shells plus the blessed NewRead / NewWrite constructors.
 // The architectural notes that users read — the read/write split, the
 // Check/RecordAsSent contract, deferred breadcrumbs, replay — live on
 // [pith/protect] (where users find them).
@@ -20,105 +23,9 @@ import (
 	"time"
 
 	"github.com/homemade/pith/coalesce"
+	"github.com/homemade/pith/protect"
 	"github.com/homemade/pith/sendstate"
 )
-
-// RequestMeta is the addressing primitive: the target slot plus the
-// replay breadcrumb, carrying no content fingerprint. It is the complete
-// request for a read gate ([ReadGate]); it is the addressing half of a
-// write gate ([WriteGate]) call, which adds a contentHash argument; and
-// it is embedded by [DeferredRequest] on the output side of a replay
-// sweep, where the payload hasn't been re-derived yet.
-type RequestMeta struct {
-	// TargetKey identifies the per-key slot used by dedupe and every
-	// attached Coalescer (typically "{activity-id}:{contact-id}" or
-	// similar). The shared key across all layers is what lets them
-	// collapse to a single record per target.
-	TargetKey string
-
-	// MessageRef is caller-defined data stored in the sendstate entry's
-	// LastDeferredMessageRef when a Check returns DecisionDeferred (write or
-	// read gate). A sweep layer reads it back to re-derive and re-emit.
-	// Typically a small reference (e.g. an upstream event ID + context,
-	// JSON-encoded). A write sweep re-emits the re-derived payload; a read
-	// sweep re-derives the target and re-fetches current state.
-	MessageRef []byte
-}
-
-// DeferredRequest is the unit yielded by [WriteGate.ReplayCandidates] /
-// [ReadGate.ReplayCandidates]: a pending deferral whose attached Coalescer
-// caps currently have room to re-emit. It embeds [RequestMeta] (target key
-// + breadcrumb — what the consumer re-derives from and re-emits via Check)
-// and adds the timestamp of the most recent deferral, so the consumer can
-// reason about age without a second read.
-type DeferredRequest struct {
-	RequestMeta
-
-	// DeferredAt is the timestamp of the most recent deferral on this
-	// key (the tail of [sendstate.Entry.LastNDeferredTimes], via
-	// [sendstate.Entry.LastDeferredTime]).
-	DeferredAt time.Time
-}
-
-// Decision is the outcome of a Check call.
-type Decision int
-
-const (
-	// DecisionProceed: caller should perform the gated operation, then
-	// call RecordAsSent on success.
-	DecisionProceed Decision = iota
-
-	// DecisionDeduped: caller should drop the operation — the content
-	// fingerprint is identical to the most recent successful send for
-	// this key, so re-sending is genuinely redundant. Write gates only
-	// (a read gate has no content to dedupe). Reason is "duplicate
-	// content"; no breadcrumb is stamped — the duplicate is already at
-	// the destination, so there is nothing to replay.
-	DecisionDeduped
-
-	// DecisionDeferred: a Coalescer cap pushed back. Reason names the
-	// Coalescer. Check stamps a deferred breadcrumb
-	// ([sendstate.Store.RecordAsDeferred]) so a consumer-side sweep can
-	// re-emit once the cap window clears — the deferred operation is one
-	// the caller still intends to perform (a write to retry, or a read to
-	// re-take against current state).
-	DecisionDeferred
-)
-
-// String returns the decision name (for logging).
-func (d Decision) String() string {
-	switch d {
-	case DecisionProceed:
-		return "Proceed"
-	case DecisionDeduped:
-		return "Deduped"
-	case DecisionDeferred:
-		return "Deferred"
-	default:
-		return "Unknown"
-	}
-}
-
-// Outcome reports a Check result. Decision is always actionable; Err
-// carries any backing-store failure encountered along the way (so a
-// caller can log it without losing the policy outcome).
-type Outcome struct {
-	// Decision is the policy outcome the caller should act on. Always
-	// meaningful, even when Err is non-nil.
-	Decision Decision
-
-	// Reason is human-readable detail for logging. Empty on a proceed;
-	// "duplicate content" on a DecisionDeduped; the Coalescer's derived
-	// name on a DecisionDeferred.
-	Reason string
-
-	// Err is the backing-store error encountered while making the
-	// decision, or nil. A ReadEntry failure fails open (Decision =
-	// DecisionProceed); a failed RecordAsDeferred stamp still yields
-	// DecisionDeferred with the error attached. Callers act on Decision
-	// and log Err if set.
-	Err error
-}
 
 // gate holds the shared protection policy for one store. The `dedupe`
 // flag is the only read-vs-write difference. The base shells [ReadGate] /
@@ -145,46 +52,16 @@ type scopedGate struct {
 	namespace string
 }
 
-// ReadProtector / ReadNamespace / WriteProtector / WriteNamespace are the
-// public gate interfaces, defined here (not in pith/protect) so the concrete
-// ReadGate.Namespace can return the ReadNamespace interface and still satisfy
-// the public surface: pith/protect re-exports these as type aliases, and Go
-// requires identical (not merely structurally-equal) return types for interface
-// satisfaction. ReadGate/WriteGate are the bases; the *NamespaceGate types are
-// the scoped implementations.
-type (
-	// ReadProtector is the base read gate — mints namespace handles only.
-	ReadProtector interface {
-		Namespace(ns string) ReadNamespace
-	}
-	// ReadNamespace is a read gate scoped to one namespace — the gating surface.
-	ReadNamespace interface {
-		Check(ctx context.Context, meta RequestMeta) Outcome
-		RecordAsSent(ctx context.Context, meta RequestMeta) error
-		ReplayCandidates(ctx context.Context, limit int) ([]DeferredRequest, error)
-	}
-	// WriteProtector is the base write gate — mints namespace handles only.
-	WriteProtector interface {
-		Namespace(ns string) WriteNamespace
-	}
-	// WriteNamespace is a write gate scoped to one namespace — the gating surface.
-	WriteNamespace interface {
-		Check(ctx context.Context, meta RequestMeta, contentHash string) Outcome
-		RecordAsSent(ctx context.Context, meta RequestMeta, contentHash string) error
-		ReplayCandidates(ctx context.Context, limit int) ([]DeferredRequest, error)
-	}
-)
-
 // ReadGate is the base read-side protector: coalescers only, no dedupe. It only
 // mints namespace handles via [ReadGate.Namespace]; the gating methods live on
-// [ReadNamespaceGate]. Satisfies [ReadProtector]. Construct via the factory
-// subpackages.
+// [ReadNamespaceGate]. Satisfies [pith/protect.ReadProtector]. Construct via the
+// factory subpackages.
 type ReadGate struct{ *gate }
 
 // Namespace returns a read handle scoped to ns ("" = the whole store). Like
 // selecting a Mongo collection off a database: all gating happens through the
 // returned handle.
-func (r ReadGate) Namespace(ns string) ReadNamespace {
+func (r ReadGate) Namespace(ns string) protect.ReadNamespace {
 	return ReadNamespaceGate{&scopedGate{gate: r.gate, namespace: ns}}
 }
 
@@ -195,18 +72,18 @@ type ReadNamespaceGate struct{ *scopedGate }
 // Check gates a candidate read. Returns DecisionProceed or, on a Coalescer
 // cap, DecisionDeferred (a breadcrumb is stamped for the replay sweep). Never
 // DecisionDeduped (no dedupe layer).
-func (r ReadNamespaceGate) Check(ctx context.Context, meta RequestMeta) Outcome {
+func (r ReadNamespaceGate) Check(ctx context.Context, meta protect.RequestMeta) protect.Outcome {
 	return r.check(ctx, meta, "")
 }
 
 // RecordAsSent commits a performed read, advancing the Coalescer counts.
-func (r ReadNamespaceGate) RecordAsSent(ctx context.Context, meta RequestMeta) error {
+func (r ReadNamespaceGate) RecordAsSent(ctx context.Context, meta protect.RequestMeta) error {
 	return r.record(ctx, meta, "")
 }
 
 // ReplayCandidates collects pending deferred reads in this namespace whose
 // Coalescer caps now have room. See [scopedGate.replay] for the full contract.
-func (r ReadNamespaceGate) ReplayCandidates(ctx context.Context, limit int) ([]DeferredRequest, error) {
+func (r ReadNamespaceGate) ReplayCandidates(ctx context.Context, limit int) ([]protect.DeferredRequest, error) {
 	return r.replay(ctx, limit)
 }
 
@@ -217,7 +94,7 @@ func (r ReadNamespaceGate) ReplayCandidates(ctx context.Context, limit int) ([]D
 type WriteGate struct{ *gate }
 
 // Namespace returns a write handle scoped to ns ("" = the whole store).
-func (w WriteGate) Namespace(ns string) WriteNamespace {
+func (w WriteGate) Namespace(ns string) protect.WriteNamespace {
 	return WriteNamespaceGate{&scopedGate{gate: w.gate, namespace: ns}}
 }
 
@@ -229,18 +106,18 @@ type WriteNamespaceGate struct{ *scopedGate }
 // Check gates a candidate write. Returns DecisionProceed, DecisionDeduped
 // (identical content), or DecisionDeferred (a Coalescer cap fired — a
 // breadcrumb is stamped for the replay sweep).
-func (w WriteNamespaceGate) Check(ctx context.Context, meta RequestMeta, contentHash string) Outcome {
+func (w WriteNamespaceGate) Check(ctx context.Context, meta protect.RequestMeta, contentHash string) protect.Outcome {
 	return w.check(ctx, meta, contentHash)
 }
 
 // RecordAsSent commits a successful write (TargetKey → contentHash).
-func (w WriteNamespaceGate) RecordAsSent(ctx context.Context, meta RequestMeta, contentHash string) error {
+func (w WriteNamespaceGate) RecordAsSent(ctx context.Context, meta protect.RequestMeta, contentHash string) error {
 	return w.record(ctx, meta, contentHash)
 }
 
 // ReplayCandidates collects pending deferrals in this namespace whose Coalescer
 // caps now have room. See [scopedGate.replay] for the full contract.
-func (w WriteNamespaceGate) ReplayCandidates(ctx context.Context, limit int) ([]DeferredRequest, error) {
+func (w WriteNamespaceGate) ReplayCandidates(ctx context.Context, limit int) ([]protect.DeferredRequest, error) {
 	return w.replay(ctx, limit)
 }
 
@@ -336,19 +213,19 @@ func newGate(store sendstate.Store, dedupe bool, coalescers []coalesce.Coalescer
 //     breadcrumb for the consumer sweep and returns DecisionDeferred — read
 //     and write gates alike.
 //
-// Backing-store errors are fail-open via [Outcome.Err]: a ReadEntry
+// Backing-store errors are fail-open via [protect.Outcome.Err]: a ReadEntry
 // failure yields (DecisionProceed, Err); a failed RecordAsDeferred stamp
 // still yields DecisionDeferred with the error attached.
-func (g *scopedGate) check(ctx context.Context, meta RequestMeta, contentHash string) Outcome {
+func (g *scopedGate) check(ctx context.Context, meta protect.RequestMeta, contentHash string) protect.Outcome {
 	now := time.Now()
 	entry, err := g.store.ReadEntry(ctx, meta.TargetKey)
 	if err != nil {
-		return Outcome{Decision: DecisionProceed, Err: err}
+		return protect.Outcome{Decision: protect.DecisionProceed, Err: err}
 	}
 
 	// Layer 1: content dedupe (write gates only).
 	if g.dedupe && entry.Seen(contentHash) {
-		return Outcome{Decision: DecisionDeduped, Reason: "duplicate content"}
+		return protect.Outcome{Decision: protect.DecisionDeduped, Reason: "duplicate content"}
 	}
 
 	// Layer 2: each attached Coalescer in order. The deferral stamps this
@@ -357,11 +234,11 @@ func (g *scopedGate) check(ctx context.Context, meta RequestMeta, contentHash st
 		if c.ShouldDefer(entry, now) {
 			capName, _, _ := c.CapPolicy()
 			recErr := g.store.RecordAsDeferred(ctx, meta.TargetKey, g.namespace, meta.MessageRef)
-			return Outcome{Decision: DecisionDeferred, Reason: capName, Err: recErr}
+			return protect.Outcome{Decision: protect.DecisionDeferred, Reason: capName, Err: recErr}
 		}
 	}
 
-	return Outcome{Decision: DecisionProceed}
+	return protect.Outcome{Decision: protect.DecisionProceed}
 }
 
 // record commits a successful send: writes (TargetKey → contentHash) to
@@ -369,13 +246,13 @@ func (g *scopedGate) check(ctx context.Context, meta RequestMeta, contentHash st
 // incrementing TotalSent. Read gates pass an empty contentHash. It stamps this
 // handle's namespace on the entry + metrics so a send-only key (never deferred)
 // still carries its namespace.
-func (g *scopedGate) record(ctx context.Context, meta RequestMeta, contentHash string) error {
+func (g *scopedGate) record(ctx context.Context, meta protect.RequestMeta, contentHash string) error {
 	return g.store.RecordAsSent(ctx, meta.TargetKey, g.namespace, contentHash)
 }
 
 // replay collects pending deferrals ready to re-emit — those whose
-// attached Coalescer caps currently have room — as [DeferredRequest]
-// (the embedded [RequestMeta] carries the target key + breadcrumb;
+// attached Coalescer caps currently have room — as [protect.DeferredRequest]
+// (the embedded [protect.RequestMeta] carries the target key + breadcrumb;
 // DeferredAt carries the most recent deferral time). Entries still inside
 // a cap window are skipped: a re-emit would just defer again and waste
 // the (typically expensive) re-derivation.
@@ -392,12 +269,12 @@ func (g *scopedGate) record(ctx context.Context, meta RequestMeta, contentHash s
 // on a write gate it still runs when the consumer re-emits each candidate
 // via [WriteNamespaceGate.Check]; a read gate ([ReadNamespaceGate.Check]) has
 // no dedupe and re-takes the read against current state.
-func (g *scopedGate) replay(ctx context.Context, limit int) ([]DeferredRequest, error) {
-	var out []DeferredRequest
+func (g *scopedGate) replay(ctx context.Context, limit int) ([]protect.DeferredRequest, error) {
+	var out []protect.DeferredRequest
 	err := g.store.RangeDeferred(ctx, limit, g.namespace, func(key string, e sendstate.Entry) bool {
 		if g.capsClear(e, time.Now()) {
-			out = append(out, DeferredRequest{
-				RequestMeta: RequestMeta{TargetKey: key, MessageRef: e.LastDeferredMessageRef},
+			out = append(out, protect.DeferredRequest{
+				RequestMeta: protect.RequestMeta{TargetKey: key, MessageRef: e.LastDeferredMessageRef},
 				DeferredAt:  e.LastDeferredTime(),
 			})
 		}

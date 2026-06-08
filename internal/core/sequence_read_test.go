@@ -9,6 +9,7 @@ import (
 
 	"github.com/homemade/pith/coalesce"
 	"github.com/homemade/pith/internal/core"
+	"github.com/homemade/pith/protect"
 	"github.com/homemade/pith/sendstate"
 	"github.com/homemade/pith/sendstate/memory"
 	"github.com/joineduptech/doc/sequencerec"
@@ -27,25 +28,25 @@ import (
 // recordingProtector (write gate) without the contentHash — a read has no
 // payload to fingerprint.
 type recordingReadProtector struct {
-	inner core.ReadNamespace
+	inner protect.ReadNamespace
 	rec   *sequencerec.Recorder
 }
 
-func (r *recordingReadProtector) Check(ctx context.Context, meta core.RequestMeta) core.Outcome {
+func (r *recordingReadProtector) Check(ctx context.Context, meta protect.RequestMeta) protect.Outcome {
 	r.rec.Enter("Client", "Protector", "Check", nil)
 	out := r.inner.Check(ctx, meta)
 	r.rec.Exit([]any{outcomeLabel(out)})
 	return out
 }
 
-func (r *recordingReadProtector) RecordAsSent(ctx context.Context, meta core.RequestMeta) error {
+func (r *recordingReadProtector) RecordAsSent(ctx context.Context, meta protect.RequestMeta) error {
 	r.rec.Enter("Client", "Protector", "RecordAsSent", nil)
 	err := r.inner.RecordAsSent(ctx, meta)
 	r.rec.Exit([]any{err})
 	return err
 }
 
-func (r *recordingReadProtector) ReplayCandidates(ctx context.Context, limit int) ([]core.DeferredRequest, error) {
+func (r *recordingReadProtector) ReplayCandidates(ctx context.Context, limit int) ([]protect.DeferredRequest, error) {
 	r.rec.Enter("Client", "Protector", "ReplayCandidates", []any{limit})
 	ready, err := r.inner.ReplayCandidates(ctx, limit)
 	r.rec.Exit([]any{fmt.Sprintf("%d DeferredRequest", len(ready))})
@@ -113,13 +114,13 @@ func TestReadGateScenarios(t *testing.T) {
 	pr := &recordingReadProtector{inner: p.Namespace(""), rec: rec}
 
 	rec.Run(t, scenario1, func(t *testing.T) {
-		meta := core.RequestMeta{TargetKey: "campaign-1:webhooks:profile-1", MessageRef: []byte("profile-1@v1")}
+		meta := protect.RequestMeta{TargetKey: "campaign-1:webhooks:profile-1", MessageRef: []byte("profile-1@v1")}
 		rec.Note("Check(target=campaign-1:webhooks:profile-1) — leading fire, no recent activity")
 		out := pr.Check(ctx, meta)
 		if out.Err != nil {
 			t.Fatalf("Check: %v", out.Err)
 		}
-		if out.Decision != core.DecisionProceed {
+		if out.Decision != protect.DecisionProceed {
 			t.Fatalf("want Proceed, got %s", out.Decision)
 		}
 		rec.Note(fmt.Sprintf("→ %s", out.Decision))
@@ -131,13 +132,13 @@ func TestReadGateScenarios(t *testing.T) {
 	})
 
 	rec.Run(t, "same-target read within the window is deferred (breadcrumb stamped)", func(t *testing.T) {
-		meta := core.RequestMeta{TargetKey: "campaign-1:webhooks:profile-1", MessageRef: []byte("profile-1@v2")}
+		meta := protect.RequestMeta{TargetKey: "campaign-1:webhooks:profile-1", MessageRef: []byte("profile-1@v2")}
 		rec.Note("Check(target=campaign-1:webhooks:profile-1) — burst: a send is within the window")
 		out := pr.Check(ctx, meta)
 		if out.Err != nil {
 			t.Fatalf("Check: %v", out.Err)
 		}
-		if out.Decision != core.DecisionDeferred {
+		if out.Decision != protect.DecisionDeferred {
 			t.Fatalf("want Deferred, got %s", out.Decision)
 		}
 		if want := "trailing-edge debounce 100ms"; out.Reason != want {
