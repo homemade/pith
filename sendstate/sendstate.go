@@ -215,12 +215,30 @@ func countInWindow(times []time.Time, now time.Time, window time.Duration) int {
 //	    rate := float64(met.TotalSent) / span.Hours()
 //	}
 type Metrics struct {
+	// Tenant is the optional OUTER scoping token this key belongs to (the
+	// caller-defined value bound on the protector's tenant handle, see
+	// [pith/protect.ReadProtector.Tenant] / [pith/protect.WriteProtector.Tenant];
+	// "" = untenanted). Stamped on every [Store.RecordAsSent] /
+	// [Store.RecordAsDeferred] alongside Namespace, so it is present even
+	// for a send-only key. Constant per key.
+	//
+	// Tenant is a labelling field for observability and per-tenant queries —
+	// it does NOT affect the per-key identifier (TargetKey) nor the
+	// sweep-scoping of [Store.RangeDeferred] (still namespace-scoped). When
+	// multiple tenants share a store and need cross-tenant key isolation, the
+	// caller must include the tenant in TargetKey itself; pith does not derive
+	// keys from Tenant. The chain Tenant -> Namespace expresses a two-level
+	// scope hierarchy on the metrics doc: equality on Tenant leads a compound
+	// index that ranks within the tenant.
+	Tenant string
+
 	// Namespace is the sweep-scoping token this key belongs to (the
 	// caller-defined value bound on the protector's namespace handle; ""
 	// = the whole store). Stamped on every [Store.RecordAsSent] /
 	// [Store.RecordAsDeferred], so it is present even for a send-only key.
 	// Constant per key. Lets observability group/filter lifetime metrics by
-	// namespace (e.g. per-tenant cap-pressure) without parsing the key.
+	// namespace (e.g. per-campaign cap-pressure) without parsing the key.
+	// Paired with Tenant when a two-level scope is in use.
 	Namespace string
 
 	// TotalSent is the lifetime count of [Store.RecordAsSent] calls
@@ -296,23 +314,28 @@ type Store interface {
 	// only send-side state — the deferred breadcrumb,
 	// LastNDeferredTimes, and LastDeferredAt are all left intact; the
 	// newer send timestamp is what makes a prior deferral no longer
-	// pending. It also stamps namespace (the caller-defined token bound
-	// on the protector's namespace handle; "" = the whole store) on both
-	// the entry and the [Metrics] doc, so a send-only key — one never
-	// deferred — still carries its namespace for per-namespace metrics
-	// queries.
-	RecordAsSent(ctx context.Context, key, namespace, contentHash string) error
+	// pending.
+	//
+	// It also stamps tenant + namespace on both the entry and the [Metrics]
+	// doc, so a send-only key — one never deferred — still carries both for
+	// per-tenant / per-namespace metrics queries. tenant is the outer
+	// scoping token (bound on the protector's tenant handle; "" = untenanted)
+	// and namespace is the sweep-scoping token (bound on the namespace handle;
+	// "" = the whole store). Both are constant per key.
+	RecordAsSent(ctx context.Context, key, tenant, namespace, contentHash string) error
 
 	// RecordAsDeferred sets LastDeferredMessageRef, appends a
 	// timestamp to LastNDeferredTimes, refreshes the Entry TTL,
 	// increments TotalDeferred, and stamps LastDeferredAt. Does not
-	// touch ContentHash, LastSentAt, or LastNSendTimes. It also stamps
-	// namespace (the caller-defined sweep-scoping token bound on the
-	// protector's namespace handle; "" = the whole store) on the entry —
-	// so [Store.RangeDeferred] can filter to it — and on the [Metrics] doc.
-	// The namespace is constant per key, so its value is stable across
+	// touch ContentHash, LastSentAt, or LastNSendTimes.
+	//
+	// It also stamps tenant + namespace on the entry — namespace so
+	// [Store.RangeDeferred] can filter to it; tenant as a labelling field —
+	// and on the [Metrics] doc. tenant is the outer scoping token (""
+	// = untenanted); namespace is the sweep-scoping token ("" = the whole
+	// store). Both are constant per key, so their values are stable across
 	// sends and re-deferrals.
-	RecordAsDeferred(ctx context.Context, key, namespace string, messageRef []byte) error
+	RecordAsDeferred(ctx context.Context, key, tenant, namespace string, messageRef []byte) error
 
 	// ReadEntry returns the key's working [Entry]. Two distinct cases
 	// both return the zero Entry, distinguishable by err:

@@ -43,26 +43,40 @@ type gate struct {
 	dedupe bool
 }
 
-// scopedGate binds a *gate to a namespace. The gating methods (check / record /
-// replay) live here, so the namespace is fixed once on the handle and can't
-// diverge between the Check that defers and the sweep that drains. "" is the
-// whole-store namespace.
+// scopedGate binds a *gate to a (tenant, namespace) pair. The gating methods
+// (check / record / replay) live here, so the scope is fixed once on the
+// handle and can't diverge between the Check that defers and the sweep that
+// drains. "" tenant is untenanted; "" namespace is the whole store.
 type scopedGate struct {
 	*gate
+	tenant    string
 	namespace string
 }
 
 // ReadGate is the base read-side protector: coalescers only, no dedupe. It only
-// mints namespace handles via [ReadGate.Namespace]; the gating methods live on
-// [ReadNamespaceGate]. Satisfies [pith/protect.ReadProtector]. Construct via the
-// factory subpackages.
-type ReadGate struct{ *gate }
+// mints namespace handles via [ReadGate.Namespace] (optionally tenant-bound
+// via [ReadGate.Tenant]); the gating methods live on [ReadNamespaceGate].
+// Satisfies [pith/protect.ReadProtector]. Construct via the factory
+// subpackages.
+type ReadGate struct {
+	*gate
+	tenant string // bound by Tenant; "" = untenanted
+}
 
 // Namespace returns a read handle scoped to ns ("" = the whole store). Like
 // selecting a Mongo collection off a database: all gating happens through the
-// returned handle.
+// returned handle. When the receiver is tenant-bound, the returned handle
+// stamps the tenant alongside the namespace on every write it commits.
 func (r ReadGate) Namespace(ns string) protect.ReadNamespace {
-	return ReadNamespaceGate{&scopedGate{gate: r.gate, namespace: ns}}
+	return ReadNamespaceGate{&scopedGate{gate: r.gate, tenant: r.tenant, namespace: ns}}
+}
+
+// Tenant returns a new ReadGate bound to t as the outer scope. The receiver
+// is unaffected — two tenants can be served from the same root protector by
+// holding two separate tenant-bound handles. Tenant("") returns the
+// untenanted handle.
+func (r ReadGate) Tenant(t string) protect.ReadProtector {
+	return ReadGate{gate: r.gate, tenant: t}
 }
 
 // ReadNamespaceGate is a [ReadGate] scoped to one namespace: Check / RecordAsSent
@@ -88,14 +102,26 @@ func (r ReadNamespaceGate) ReplayCandidates(ctx context.Context, limit int) ([]p
 }
 
 // WriteGate is the base write-side protector: content dedupe + coalescers. It
-// only mints namespace handles via [WriteGate.Namespace]; the gating methods
-// live on [WriteNamespaceGate]. Satisfies [pith/protect.WriteProtector].
-// Construct via the factory subpackages.
-type WriteGate struct{ *gate }
+// only mints namespace handles via [WriteGate.Namespace] (optionally
+// tenant-bound via [WriteGate.Tenant]); the gating methods live on
+// [WriteNamespaceGate]. Satisfies [pith/protect.WriteProtector]. Construct
+// via the factory subpackages.
+type WriteGate struct {
+	*gate
+	tenant string // bound by Tenant; "" = untenanted
+}
 
-// Namespace returns a write handle scoped to ns ("" = the whole store).
+// Namespace returns a write handle scoped to ns ("" = the whole store). When
+// the receiver is tenant-bound, the returned handle stamps the tenant
+// alongside the namespace on every write it commits.
 func (w WriteGate) Namespace(ns string) protect.WriteNamespace {
-	return WriteNamespaceGate{&scopedGate{gate: w.gate, namespace: ns}}
+	return WriteNamespaceGate{&scopedGate{gate: w.gate, tenant: w.tenant, namespace: ns}}
+}
+
+// Tenant returns a new WriteGate bound to t as the outer scope. The receiver
+// is unaffected. Tenant("") returns the untenanted handle.
+func (w WriteGate) Tenant(t string) protect.WriteProtector {
+	return WriteGate{gate: w.gate, tenant: t}
 }
 
 // WriteNamespaceGate is a [WriteGate] scoped to one namespace: Check /
@@ -123,16 +149,18 @@ func (w WriteNamespaceGate) ReplayCandidates(ctx context.Context, limit int) ([]
 
 // NewRead builds a read gate over store with the given Coalescers (at
 // least one is required; see [newGate]). Internal — called by the factory
-// subpackages.
+// subpackages. The returned gate is untenanted; callers add an outer scope
+// via [ReadGate.Tenant].
 func NewRead(store sendstate.Store, coalescers ...coalesce.Coalescer) ReadGate {
-	return ReadGate{newGate(store, false, coalescers)}
+	return ReadGate{gate: newGate(store, false, coalescers)}
 }
 
 // NewWrite builds a write gate over store with the given Coalescers (at
 // least one is required; see [newGate]). Internal — called by the factory
-// subpackages.
+// subpackages. The returned gate is untenanted; callers add an outer scope
+// via [WriteGate.Tenant].
 func NewWrite(store sendstate.Store, coalescers ...coalesce.Coalescer) WriteGate {
-	return WriteGate{newGate(store, true, coalescers)}
+	return WriteGate{gate: newGate(store, true, coalescers)}
 }
 
 // LargestHardCap returns the largest hardCap among coalescers, or 0 when
@@ -229,11 +257,12 @@ func (g *scopedGate) check(ctx context.Context, meta protect.RequestMeta, conten
 	}
 
 	// Layer 2: each attached Coalescer in order. The deferral stamps this
-	// handle's namespace so the replay sweep can scope to it.
+	// handle's tenant + namespace so the replay sweep can scope to namespace
+	// and observability can group by tenant.
 	for _, c := range g.coalescers {
 		if c.ShouldDefer(entry, now) {
 			capName, _, _ := c.CapPolicy()
-			recErr := g.store.RecordAsDeferred(ctx, meta.TargetKey, g.namespace, meta.MessageRef)
+			recErr := g.store.RecordAsDeferred(ctx, meta.TargetKey, g.tenant, g.namespace, meta.MessageRef)
 			return protect.Outcome{Decision: protect.DecisionDeferred, Reason: capName, Err: recErr}
 		}
 	}
@@ -244,10 +273,10 @@ func (g *scopedGate) check(ctx context.Context, meta protect.RequestMeta, conten
 // record commits a successful send: writes (TargetKey → contentHash) to
 // the store, appending a timestamp to the rolling send list and
 // incrementing TotalSent. Read gates pass an empty contentHash. It stamps this
-// handle's namespace on the entry + metrics so a send-only key (never deferred)
-// still carries its namespace.
+// handle's tenant + namespace on the entry + metrics so a send-only key
+// (never deferred) still carries both scopes.
 func (g *scopedGate) record(ctx context.Context, meta protect.RequestMeta, contentHash string) error {
-	return g.store.RecordAsSent(ctx, meta.TargetKey, g.namespace, contentHash)
+	return g.store.RecordAsSent(ctx, meta.TargetKey, g.tenant, g.namespace, contentHash)
 }
 
 // replay collects pending deferrals ready to re-emit — those whose

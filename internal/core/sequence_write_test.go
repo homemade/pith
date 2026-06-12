@@ -136,14 +136,14 @@ func (r *recordingSendStore) RangeDeferred(ctx context.Context, limit int, parti
 	return err
 }
 
-func (r *recordingSendStore) RecordAsSent(ctx context.Context, key, namespace, contentHash string) error {
-	err := r.inner.RecordAsSent(ctx, key, namespace, contentHash)
+func (r *recordingSendStore) RecordAsSent(ctx context.Context, key, tenant, namespace, contentHash string) error {
+	err := r.inner.RecordAsSent(ctx, key, tenant, namespace, contentHash)
 	r.rec.RecordCall("Protector", "Store", "RecordAsSent", []any{key, contentHash}, []any{err})
 	return err
 }
 
-func (r *recordingSendStore) RecordAsDeferred(ctx context.Context, key, partition string, messageRef []byte) error {
-	err := r.inner.RecordAsDeferred(ctx, key, partition, messageRef)
+func (r *recordingSendStore) RecordAsDeferred(ctx context.Context, key, tenant, partition string, messageRef []byte) error {
+	err := r.inner.RecordAsDeferred(ctx, key, tenant, partition, messageRef)
 	r.rec.RecordCall("Protector", "Store", "RecordAsDeferred", []any{key, fmt.Sprintf("<%d bytes>", len(messageRef))}, []any{err})
 	return err
 }
@@ -289,8 +289,8 @@ func TestWriteGateScenarios(t *testing.T) {
 		// outside the debounce window — the debounce ShouldDefer
 		// will return false (no recent send), so the diagram shows
 		// debounce checking and clearing before quota trips.
-		_ = innerStore.RecordAsSent(ctx, "act-1:contact-3", "", "setup-1")
-		_ = innerStore.RecordAsSent(ctx, "act-1:contact-3", "", "setup-2")
+		_ = innerStore.RecordAsSent(ctx, "act-1:contact-3", "", "", "setup-1")
+		_ = innerStore.RecordAsSent(ctx, "act-1:contact-3", "", "", "setup-2")
 		time.Sleep(2 * debounceWindow)
 
 		meta := protect.RequestMeta{TargetKey: "act-1:contact-3", MessageRef: []byte("activity-C")}

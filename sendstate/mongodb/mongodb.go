@@ -55,6 +55,7 @@ type entryDoc struct {
 	LastNDeferredTimes     []time.Time `bson:"lastNDeferredTimes,omitempty"`
 	LastSentAt             time.Time   `bson:"lastSentAt,omitempty"`
 	LastDeferredAt         time.Time   `bson:"lastDeferredAt,omitempty"`
+	Tenant                 string      `bson:"tenant,omitempty"`
 	Namespace              string      `bson:"namespace,omitempty"`
 	ExpireAt               time.Time   `bson:"expireAt"`
 }
@@ -71,6 +72,7 @@ func (d entryDoc) entry() sendstate.Entry {
 // metricsDoc is the metrics-collection document — the lifetime rollup.
 type metricsDoc struct {
 	Key             string    `bson:"_id"`
+	Tenant          string    `bson:"tenant,omitempty"`
 	Namespace       string    `bson:"namespace,omitempty"`
 	TotalSent       uint64    `bson:"totalSent"`
 	TotalDeferred   uint64    `bson:"totalDeferred"`
@@ -86,6 +88,7 @@ type metricsDoc struct {
 
 func (d metricsDoc) metrics() sendstate.Metrics {
 	return sendstate.Metrics{
+		Tenant:          d.Tenant,
 		Namespace:       d.Namespace,
 		TotalSent:       d.TotalSent,
 		TotalDeferred:   d.TotalDeferred,
@@ -292,7 +295,7 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 // Two round-trips: entries update, then metrics update. Eventually
 // consistent across the two collections; only entries drives
 // decisions, so this never affects an answer.
-func (s *Store) RecordAsSent(ctx context.Context, key, namespace, contentHash string) error {
+func (s *Store) RecordAsSent(ctx context.Context, key, tenant, namespace, contentHash string) error {
 	now := time.Now()
 
 	// Dedupe-only floor: at maxSendTimes == 1 the send-time list holds a
@@ -304,7 +307,7 @@ func (s *Store) RecordAsSent(ctx context.Context, key, namespace, contentHash st
 	// exactly when the peaks become meaningful.
 	if s.maxSendTimes <= 1 {
 		_, err := s.entries.UpdateByID(ctx, key, bson.M{
-			"$set":  bson.M{"contentHash": contentHash, "lastSentAt": now, "namespace": namespace, "expireAt": now.Add(s.ttl)},
+			"$set":  bson.M{"contentHash": contentHash, "lastSentAt": now, "tenant": tenant, "namespace": namespace, "expireAt": now.Add(s.ttl)},
 			"$push": bson.M{"lastNSendTimes": bson.M{"$each": bson.A{now}, "$slice": -s.maxSendTimes}},
 		}, options.UpdateOne().SetUpsert(true))
 		if err != nil {
@@ -312,7 +315,7 @@ func (s *Store) RecordAsSent(ctx context.Context, key, namespace, contentHash st
 		}
 		_, err = s.metrics.UpdateByID(ctx, key, bson.M{
 			"$inc": bson.M{"totalSent": 1},
-			"$set": bson.M{"lastSentAt": now, "namespace": namespace},
+			"$set": bson.M{"lastSentAt": now, "tenant": tenant, "namespace": namespace},
 			"$min": bson.M{"firstSentAt": now},
 		}, options.UpdateOne().SetUpsert(true))
 		return err
@@ -323,7 +326,7 @@ func (s *Store) RecordAsSent(ctx context.Context, key, namespace, contentHash st
 	// below. Same write and round-trip — it just returns the document.
 	var doc entryDoc
 	err := s.entries.FindOneAndUpdate(ctx, bson.M{"_id": key}, bson.M{
-		"$set":  bson.M{"contentHash": contentHash, "lastSentAt": now, "namespace": namespace, "expireAt": now.Add(s.ttl)},
+		"$set":  bson.M{"contentHash": contentHash, "lastSentAt": now, "tenant": tenant, "namespace": namespace, "expireAt": now.Add(s.ttl)},
 		"$push": bson.M{"lastNSendTimes": bson.M{"$each": bson.A{now}, "$slice": -s.maxSendTimes}},
 	}, options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After)).Decode(&doc)
 	if err != nil {
@@ -342,6 +345,7 @@ func (s *Store) RecordAsSent(ctx context.Context, key, namespace, contentHash st
 	// reader can tell apart from a real 0. (E.g. a 2h-TTL store folds peak1h
 	// but skips peak24h.)
 	set := bson.M{
+		"tenant":      tenant,
 		"namespace":   namespace,
 		"totalSent":   bson.M{"$add": bson.A{bson.M{"$ifNull": bson.A{"$totalSent", 0}}, 1}},
 		"lastSentAt":  now,
@@ -381,17 +385,18 @@ func (s *Store) RecordAsSent(ctx context.Context, key, namespace, contentHash st
 }
 
 // RecordAsDeferred stamps the breadcrumb, appends the deferral
-// timestamp (and scalar lastDeferredAt tail), stamps the sweep-scoping
-// namespace, and refreshes the TTL — without touching contentHash,
-// lastNSendTimes, or lastSentAt; then bumps the deferred-side counters.
-func (s *Store) RecordAsDeferred(ctx context.Context, key, namespace string, messageRef []byte) error {
+// timestamp (and scalar lastDeferredAt tail), stamps the tenant +
+// sweep-scoping namespace, and refreshes the TTL — without touching
+// contentHash, lastNSendTimes, or lastSentAt; then bumps the
+// deferred-side counters.
+func (s *Store) RecordAsDeferred(ctx context.Context, key, tenant, namespace string, messageRef []byte) error {
 	now := time.Now()
 
-	// namespace is set unconditionally (constant per key, "" leaves it
-	// unscoped). RecordAsSent never writes it, so it survives a send and
-	// stays valid for the next re-deferral.
+	// tenant + namespace are set unconditionally (constant per key, ""
+	// leaves them unscoped). Both survive across send/defer transitions —
+	// RecordAsSent re-stamps the same passed values.
 	_, err := s.entries.UpdateByID(ctx, key, bson.M{
-		"$set":  bson.M{"lastDeferredMessageRef": messageRef, "lastDeferredAt": now, "namespace": namespace, "expireAt": now.Add(s.ttl)},
+		"$set":  bson.M{"lastDeferredMessageRef": messageRef, "lastDeferredAt": now, "tenant": tenant, "namespace": namespace, "expireAt": now.Add(s.ttl)},
 		"$push": bson.M{"lastNDeferredTimes": bson.M{"$each": bson.A{now}, "$slice": -s.maxSendTimes}},
 	}, options.UpdateOne().SetUpsert(true))
 	if err != nil {
@@ -402,7 +407,7 @@ func (s *Store) RecordAsDeferred(ctx context.Context, key, namespace string, mes
 	// firstSentAt on RecordAsSent. See that method's comment.
 	_, err = s.metrics.UpdateByID(ctx, key, bson.M{
 		"$inc": bson.M{"totalDeferred": 1},
-		"$set": bson.M{"lastDeferredAt": now, "namespace": namespace},
+		"$set": bson.M{"lastDeferredAt": now, "tenant": tenant, "namespace": namespace},
 		"$min": bson.M{"firstDeferredAt": now},
 	}, options.UpdateOne().SetUpsert(true))
 	return err
