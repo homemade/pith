@@ -23,10 +23,12 @@ import (
 
 // Mirrors pith/sendstate/mongodb's container-per-package pattern so these
 // thin wrappers get honest end-to-end coverage rather than mocking
-// around the very behaviour we're trying to verify.
+// around the very behaviour we're trying to verify. The client opened in
+// TestMain is shared across tests — production callers do the same (one
+// process-wide client, many stores).
 var (
-	testURI   string
-	dbCounter atomic.Uint64
+	testClient *driver.Client
+	dbCounter  atomic.Uint64
 )
 
 func TestMain(m *testing.M) { os.Exit(run(m)) }
@@ -36,7 +38,7 @@ func run(m *testing.M) int {
 	container, err := tcmongo.Run(ctx, "mongo:7")
 	if err != nil {
 		fmt.Printf("protect/mongodb tests skipped: cannot start container: %v\n", err)
-		return m.Run() // testURI == "" → integration tests t.Skip()
+		return m.Run() // testClient == nil → integration tests t.Skip()
 	}
 	defer func() { _ = container.Terminate(ctx) }()
 
@@ -48,7 +50,8 @@ func run(m *testing.M) int {
 
 	// Sanity ping to confirm the cluster is reachable before any test
 	// reaches it — matches the readiness check in sendstate/mongodb's
-	// TestMain.
+	// TestMain. Majority write concern is required for cross-instance
+	// correctness (see pith/sendstate/mongodb package doc).
 	client, err := driver.Connect(options.Client().ApplyURI(uri).SetWriteConcern(writeconcern.Majority()))
 	if err != nil {
 		fmt.Printf("protect/mongodb tests skipped: connect: %v\n", err)
@@ -62,7 +65,7 @@ func run(m *testing.M) int {
 		fmt.Printf("protect/mongodb tests skipped: ping: %v\n", err)
 		return m.Run()
 	}
-	testURI = uri
+	testClient = client
 	return m.Run()
 }
 
@@ -72,13 +75,15 @@ func freshDBName() string {
 	return fmt.Sprintf("pithtest_pmongo_%d", dbCounter.Add(1))
 }
 
-// The below-derived error fires *before* any Mongo I/O — exercised
-// without a container so this test runs everywhere. Surfaces the
-// misconfiguration at construction instead of letting a too-small
-// MaxSendTimes silently leak the cap in production.
+// The below-derived error fires *before* any Mongo I/O, but the new
+// caller-owned-client shape requires a non-nil client + a configured Database
+// to reach the cap check. Skip when the container isn't available rather
+// than reordering validation.
 func TestNewWriteProtector_ErrorsOnMaxSendTimesBelowDerived(t *testing.T) {
-	_, _, err := pmongo.NewWriteProtector(context.Background(), pmongo.Config{
-		URI:          "mongodb://ignored",
+	if testClient == nil {
+		t.Skip("no MongoDB container (Docker unavailable)")
+	}
+	_, err := pmongo.NewWriteProtector(context.Background(), testClient, pmongo.Config{
 		Database:     "ignored",
 		EntryTTL:     25 * time.Hour, // covers the 24h Quota window so the below-derived check (not the TTL guard) is what fires
 		MaxSendTimes: 10,             // below the quota's hardCap of 50
@@ -97,17 +102,15 @@ func TestNewWriteProtector_ErrorsOnMaxSendTimesBelowDerived(t *testing.T) {
 // attached Coalescers, the resulting WriteProtector is functional.
 // Exercises the actual derivation logic against a real mongo backend.
 func TestNewWriteProtector_AutoDerivesMaxSendTimesFromCoalescers(t *testing.T) {
-	if testURI == "" {
+	if testClient == nil {
 		t.Skip("no MongoDB container (Docker unavailable)")
 	}
 	ctx := context.Background()
 	dbName := freshDBName()
 
-	p, client, err := pmongo.NewWriteProtector(ctx, pmongo.Config{
-		URI:      testURI,
+	p, err := pmongo.NewWriteProtector(ctx, testClient, pmongo.Config{
 		Database: dbName,
 		EntryTTL: 25 * time.Hour, // must cover the 24h Quota window (core validates this)
-		Timeout:  200 * time.Millisecond,
 		// MaxSendTimes deliberately omitted — wrapper should derive it
 		// from the attached caps' largest hardCap (50).
 	},
@@ -118,12 +121,11 @@ func TestNewWriteProtector_AutoDerivesMaxSendTimesFromCoalescers(t *testing.T) {
 		t.Fatalf("NewWriteProtector: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = client.Database(dbName).Drop(context.Background())
-		_ = client.Disconnect(context.Background())
+		_ = testClient.Database(dbName).Drop(context.Background())
 	})
 
 	// Functional check: a Check + RecordAsSent round-trip works.
-	w := p.Namespace("") // whole-store namespace; gating happens on the handle
+	w := p.Tenant("").Namespace("") // untenanted, whole-store; gating happens on the handle
 	meta := protect.RequestMeta{TargetKey: "k1"}
 	if out := w.Check(ctx, meta, "h1"); out.Decision != protect.DecisionProceed || out.Err != nil {
 		t.Fatalf("first Check = %s, err=%v; want Proceed", out.Decision, out.Err)
@@ -143,27 +145,24 @@ func TestNewWriteProtector_AutoDerivesMaxSendTimesFromCoalescers(t *testing.T) {
 // DEFERS a capped read — stamping a breadcrumb that becomes a replay
 // candidate once the cap clears.
 func TestNewReadProtector_DefersAtCap(t *testing.T) {
-	if testURI == "" {
+	if testClient == nil {
 		t.Skip("no MongoDB container (Docker unavailable)")
 	}
 	ctx := context.Background()
 	dbName := freshDBName()
 
-	r, client, err := pmongo.NewReadProtector(ctx, pmongo.Config{
-		URI:      testURI,
+	r, err := pmongo.NewReadProtector(ctx, testClient, pmongo.Config{
 		Database: dbName,
 		EntryTTL: 25 * time.Hour,
-		Timeout:  200 * time.Millisecond,
 	}, coalesce.NewQuota(1, 24*time.Hour))
 	if err != nil {
 		t.Fatalf("NewReadProtector: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = client.Database(dbName).Drop(context.Background())
-		_ = client.Disconnect(context.Background())
+		_ = testClient.Database(dbName).Drop(context.Background())
 	})
 
-	rn := r.Namespace("") // whole-store namespace; gating happens on the handle
+	rn := r.Tenant("").Namespace("") // untenanted, whole-store; gating happens on the handle
 	meta := protect.RequestMeta{TargetKey: "r1", MessageRef: []byte("ref-1")}
 	if out := rn.Check(ctx, meta); out.Decision != protect.DecisionProceed || out.Err != nil {
 		t.Fatalf("first Check = %s, err=%v; want Proceed", out.Decision, out.Err)
@@ -191,25 +190,22 @@ func TestNewReadProtector_DefersAtCap(t *testing.T) {
 // — a caller wanting extra headroom (e.g. for future replay-bounded
 // scans) can set it without the wrapper second-guessing.
 func TestNewWriteProtector_RespectsExplicitMaxSendTimesAboveDerived(t *testing.T) {
-	if testURI == "" {
+	if testClient == nil {
 		t.Skip("no MongoDB container (Docker unavailable)")
 	}
 	ctx := context.Background()
 	dbName := freshDBName()
 
-	p, client, err := pmongo.NewWriteProtector(ctx, pmongo.Config{
-		URI:          testURI,
+	p, err := pmongo.NewWriteProtector(ctx, testClient, pmongo.Config{
 		Database:     dbName,
 		EntryTTL:     25 * time.Hour, // covers the 24h Quota window (core validates this)
-		Timeout:      200 * time.Millisecond,
-		MaxSendTimes: 200, // > derived (50) — should be respected.
+		MaxSendTimes: 200,            // > derived (50) — should be respected.
 	}, coalesce.NewQuota(50, 24*time.Hour))
 	if err != nil {
 		t.Fatalf("NewWriteProtector: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = client.Database(dbName).Drop(context.Background())
-		_ = client.Disconnect(context.Background())
+		_ = testClient.Database(dbName).Drop(context.Background())
 	})
 	if p == nil {
 		t.Fatalf("NewWriteProtector returned a nil WriteProtector with no error")

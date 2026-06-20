@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,12 +21,9 @@ import (
 )
 
 // testClient is the shared driver client for the package's container,
-// or nil when Docker is unavailable (every test then skips). testURI
-// captures the same container's connection string so [TestOpen] can
-// build its own client via Open without reaching through testClient.
+// or nil when Docker is unavailable (every test then skips).
 var (
 	testClient *mongo.Client
-	testURI    string
 	dbCounter  atomic.Uint64
 )
 
@@ -75,7 +71,6 @@ func run(m *testing.M) int {
 		return m.Run()
 	}
 	testClient = client
-	testURI = uri
 	return m.Run()
 }
 
@@ -440,29 +435,18 @@ func TestStore_EnsureIndexesIdempotent(t *testing.T) {
 // runs EnsureIndexes — all in one call. Verifies the Store is
 // operational end-to-end and that both expected indexes are present
 // on the entries collection.
-func TestOpen_HappyPath(t *testing.T) {
-	if testURI == "" {
+func TestEnsureIndexes_CreatesTTLAndSortIndexes(t *testing.T) {
+	if testClient == nil {
 		t.Skip("no MongoDB container (Docker unavailable)")
 	}
 	ctx := context.Background()
-	dbName := fmt.Sprintf("pithtest_open_%d", dbCounter.Add(1))
+	dbName := fmt.Sprintf("pithtest_indexes_%d", dbCounter.Add(1))
 
-	store, client, err := Open(ctx, Config{
-		URI:          testURI,
-		Database:     dbName,
-		EntryTTL:     time.Hour,
-		MaxSendTimes: 50,
-		Timeout:      200 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
+	store := New(testClient.Database(dbName), time.Hour, WithMaxSendTimes(50))
+	if err := store.EnsureIndexes(ctx); err != nil {
+		t.Fatalf("EnsureIndexes: %v", err)
 	}
-	t.Cleanup(func() {
-		// Drop the test DB via the package's shared client (the one
-		// Open dialed is being Disconnected on the next line).
-		_ = testClient.Database(dbName).Drop(context.Background())
-		_ = client.Disconnect(context.Background())
-	})
+	t.Cleanup(func() { _ = testClient.Database(dbName).Drop(context.Background()) })
 
 	// Store is functional end-to-end.
 	if err := store.RecordAsSent(ctx, "k1", "", "", "hash-A"); err != nil {
@@ -476,9 +460,8 @@ func TestOpen_HappyPath(t *testing.T) {
 		t.Fatalf("ContentHash = %q, want hash-A", entry.ContentHash)
 	}
 
-	// EnsureIndexes ran inside Open: both indexes on the entries
-	// collection exist (the TTL expireAt index and the RangeDeferred
-	// sort index).
+	// Both indexes on the entries collection exist — the TTL expireAt index
+	// and the RangeDeferred sort index.
 	cur, err := testClient.Database(dbName).Collection("entries").Indexes().List(ctx)
 	if err != nil {
 		t.Fatalf("Indexes().List: %v", err)
@@ -499,30 +482,6 @@ func TestOpen_HappyPath(t *testing.T) {
 	}
 	if !have["lastDeferredAt_1"] {
 		t.Errorf("lastDeferredAt index missing; have %v", have)
-	}
-}
-
-// Config validation runs before any I/O — these tests don't need
-// Docker and run unconditionally.
-
-func TestOpen_RequiresURI(t *testing.T) {
-	_, _, err := Open(context.Background(), Config{Database: "x", EntryTTL: time.Hour})
-	if err == nil || !strings.Contains(err.Error(), "URI") {
-		t.Fatalf("err = %v, want a URI-required error", err)
-	}
-}
-
-func TestOpen_RequiresDatabase(t *testing.T) {
-	_, _, err := Open(context.Background(), Config{URI: "mongodb://x", EntryTTL: time.Hour})
-	if err == nil || !strings.Contains(err.Error(), "Database") {
-		t.Fatalf("err = %v, want a Database-required error", err)
-	}
-}
-
-func TestOpen_RequiresPositiveEntryTTL(t *testing.T) {
-	_, _, err := Open(context.Background(), Config{URI: "mongodb://x", Database: "x"})
-	if err == nil || !strings.Contains(err.Error(), "EntryTTL") {
-		t.Fatalf("err = %v, want an EntryTTL-required error", err)
 	}
 }
 

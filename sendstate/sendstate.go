@@ -14,7 +14,8 @@
 //     read primitives every policy needs — [Entry.Seen] (content
 //     dedupe) and [Entry.CountSentInWindow] (the per-window send count
 //     [pith/coalesce.Coalescer] thresholds against) — so a single
-//     ReadEntry drives a whole [pith/protect.Protector.Check].
+//     ReadEntry drives a whole [pith/protect.WriteNamespace.Check] /
+//     [pith/protect.ReadNamespace.Check].
 //   - [Metrics] — lifetime observability rollup: TotalSent,
 //     TotalDeferred, LastSentAt, LastDeferredAt. Read via
 //     [Store.ReadMetrics]. Never expires.
@@ -43,8 +44,9 @@
 //
 // The contract is record-on-success: callers RecordAsSent only
 // after the gated operation has actually succeeded. RecordAsDeferred
-// is called by [pith/protect.Protector.Check] itself when any
-// attached Coalescer's ShouldDefer returns true.
+// is called by [pith/protect.WriteNamespace.Check] /
+// [pith/protect.ReadNamespace.Check] itself when any attached
+// Coalescer's ShouldDefer returns true.
 //
 // # TTL semantics
 //
@@ -63,11 +65,12 @@
 // storage reclamation, never a correctness mechanism, so both
 // backends answer identically no matter when the sweep/deleter runs.
 //
-// The TTL MUST be >= the largest Coalescer window in use;
-// [pith/protect.New] validates this. Given that, an expired record's
-// timestamps are all older than
-// any window, so neither a stale read (filtered out) nor a write that
-// carries them forward can change a [Entry.CountSentInWindow] result.
+// The TTL MUST be >= the largest Coalescer window in use; the
+// protector factory constructors ([pith/protect/memory.NewWriteProtector]
+// et al.) validate this. Given that, an expired record's timestamps are
+// all older than any window, so neither a stale read (filtered out) nor
+// a write that carries them forward can change a
+// [Entry.CountSentInWindow] result.
 //
 // # Concurrent / cross-store consistency
 //
@@ -305,8 +308,10 @@ type Metrics struct {
 // Store is the shared per-key send-state store. [Store.ReadEntry]
 // drives the policies ([Entry.Seen], [pith/coalesce.Coalescer.ShouldDefer]);
 // [Store.ReadMetrics] serves observability. Writes come from
-// [pith/protect.Protector.RecordAsSent] (on successful sends) and
-// [pith/protect.Protector.Check] (on Coalescer-driven deferrals).
+// [pith/protect.WriteNamespace.RecordAsSent] /
+// [pith/protect.ReadNamespace.RecordAsSent] (on successful sends) and
+// [pith/protect.WriteNamespace.Check] / [pith/protect.ReadNamespace.Check]
+// (on Coalescer-driven deferrals).
 type Store interface {
 	// RecordAsSent stores (key → contentHash) stamped at now, appends
 	// a timestamp to the key's LastNSendTimes, refreshes the Entry
@@ -345,7 +350,8 @@ type Store interface {
 	//     so policies naturally proceed.
 	//   - A backing-store failure returns (zero [Entry], non-nil err).
 	//     Callers fail-open (proceed) and surface the err for logging
-	//     — see [pith/protect.Protector.Check].
+	//     — see [pith/protect.WriteNamespace.Check] /
+	//     [pith/protect.ReadNamespace.Check].
 	//
 	// Backends honor the TTL on read (treat expired as absent) rather
 	// than relying on deletion timing, so both backends answer

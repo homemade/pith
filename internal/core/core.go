@@ -53,30 +53,39 @@ type scopedGate struct {
 	namespace string
 }
 
-// ReadGate is the base read-side protector: coalescers only, no dedupe. It only
-// mints namespace handles via [ReadGate.Namespace] (optionally tenant-bound
-// via [ReadGate.Tenant]); the gating methods live on [ReadNamespaceGate].
-// Satisfies [pith/protect.ReadProtector]. Construct via the factory
-// subpackages.
+// ReadGate is the root read-side protector: coalescers only, no dedupe. It is
+// a factory whose only method is [ReadGate.Tenant], which mints a
+// [ReadTenantGate]; that handle in turn mints the namespace-scoped
+// [ReadNamespaceGate] where the gating methods live. Satisfies
+// [pith/protect.ReadProtector]. Construct via the factory subpackages.
 type ReadGate struct {
 	*gate
-	tenant string // bound by Tenant; "" = untenanted
+}
+
+// Tenant returns a [ReadTenantGate] bound to t as the outer scope. The
+// receiver is unaffected — two tenants can be served from the same root
+// protector by holding two separate tenant-bound handles. Tenant("") returns
+// the untenanted handle.
+func (r ReadGate) Tenant(t string) protect.ReadTenant {
+	return ReadTenantGate{gate: r.gate, tenant: t}
+}
+
+// ReadTenantGate is a [ReadGate] bound to one tenant — the middle step in the
+// Tenant → Namespace chain. Mints a [ReadNamespaceGate] via
+// [ReadTenantGate.Namespace]; that scoped handle stamps the bound tenant
+// alongside the namespace on every write it commits. Satisfies
+// [pith/protect.ReadTenant].
+type ReadTenantGate struct {
+	*gate
+	tenant string // "" = untenanted
 }
 
 // Namespace returns a read handle scoped to ns ("" = the whole store). Like
 // selecting a Mongo collection off a database: all gating happens through the
-// returned handle. When the receiver is tenant-bound, the returned handle
-// stamps the tenant alongside the namespace on every write it commits.
-func (r ReadGate) Namespace(ns string) protect.ReadNamespace {
+// returned handle, which stamps this ReadTenantGate's tenant alongside the
+// namespace on every write it commits.
+func (r ReadTenantGate) Namespace(ns string) protect.ReadNamespace {
 	return ReadNamespaceGate{&scopedGate{gate: r.gate, tenant: r.tenant, namespace: ns}}
-}
-
-// Tenant returns a new ReadGate bound to t as the outer scope. The receiver
-// is unaffected — two tenants can be served from the same root protector by
-// holding two separate tenant-bound handles. Tenant("") returns the
-// untenanted handle.
-func (r ReadGate) Tenant(t string) protect.ReadProtector {
-	return ReadGate{gate: r.gate, tenant: t}
 }
 
 // ReadNamespaceGate is a [ReadGate] scoped to one namespace: Check / RecordAsSent
@@ -101,27 +110,36 @@ func (r ReadNamespaceGate) ReplayCandidates(ctx context.Context, limit int) ([]p
 	return r.replay(ctx, limit)
 }
 
-// WriteGate is the base write-side protector: content dedupe + coalescers. It
-// only mints namespace handles via [WriteGate.Namespace] (optionally
-// tenant-bound via [WriteGate.Tenant]); the gating methods live on
-// [WriteNamespaceGate]. Satisfies [pith/protect.WriteProtector]. Construct
-// via the factory subpackages.
+// WriteGate is the root write-side protector: content dedupe + coalescers. It
+// is a factory whose only method is [WriteGate.Tenant], which mints a
+// [WriteTenantGate]; that handle in turn mints the namespace-scoped
+// [WriteNamespaceGate] where the gating methods live. Satisfies
+// [pith/protect.WriteProtector]. Construct via the factory subpackages.
 type WriteGate struct {
 	*gate
-	tenant string // bound by Tenant; "" = untenanted
 }
 
-// Namespace returns a write handle scoped to ns ("" = the whole store). When
-// the receiver is tenant-bound, the returned handle stamps the tenant
-// alongside the namespace on every write it commits.
-func (w WriteGate) Namespace(ns string) protect.WriteNamespace {
+// Tenant returns a [WriteTenantGate] bound to t as the outer scope. The
+// receiver is unaffected. Tenant("") returns the untenanted handle.
+func (w WriteGate) Tenant(t string) protect.WriteTenant {
+	return WriteTenantGate{gate: w.gate, tenant: t}
+}
+
+// WriteTenantGate is a [WriteGate] bound to one tenant — the middle step in
+// the Tenant → Namespace chain. Mints a [WriteNamespaceGate] via
+// [WriteTenantGate.Namespace]; that scoped handle stamps the bound tenant
+// alongside the namespace on every write it commits. Satisfies
+// [pith/protect.WriteTenant].
+type WriteTenantGate struct {
+	*gate
+	tenant string // "" = untenanted
+}
+
+// Namespace returns a write handle scoped to ns ("" = the whole store).
+// Stamps this WriteTenantGate's tenant alongside the namespace on every write
+// it commits.
+func (w WriteTenantGate) Namespace(ns string) protect.WriteNamespace {
 	return WriteNamespaceGate{&scopedGate{gate: w.gate, tenant: w.tenant, namespace: ns}}
-}
-
-// Tenant returns a new WriteGate bound to t as the outer scope. The receiver
-// is unaffected. Tenant("") returns the untenanted handle.
-func (w WriteGate) Tenant(t string) protect.WriteProtector {
-	return WriteGate{gate: w.gate, tenant: t}
 }
 
 // WriteNamespaceGate is a [WriteGate] scoped to one namespace: Check /
@@ -147,18 +165,20 @@ func (w WriteNamespaceGate) ReplayCandidates(ctx context.Context, limit int) ([]
 	return w.replay(ctx, limit)
 }
 
-// NewRead builds a read gate over store with the given Coalescers (at
+// NewRead builds a root read gate over store with the given Coalescers (at
 // least one is required; see [newGate]). Internal — called by the factory
-// subpackages. The returned gate is untenanted; callers add an outer scope
-// via [ReadGate.Tenant].
+// subpackages. The returned gate is the root of the Tenant → Namespace
+// chain; callers reach a [ReadNamespaceGate] via [ReadGate.Tenant] →
+// [ReadTenantGate.Namespace].
 func NewRead(store sendstate.Store, coalescers ...coalesce.Coalescer) ReadGate {
 	return ReadGate{gate: newGate(store, false, coalescers)}
 }
 
-// NewWrite builds a write gate over store with the given Coalescers (at
+// NewWrite builds a root write gate over store with the given Coalescers (at
 // least one is required; see [newGate]). Internal — called by the factory
-// subpackages. The returned gate is untenanted; callers add an outer scope
-// via [WriteGate.Tenant].
+// subpackages. The returned gate is the root of the Tenant → Namespace
+// chain; callers reach a [WriteNamespaceGate] via [WriteGate.Tenant] →
+// [WriteTenantGate.Namespace].
 func NewWrite(store sendstate.Store, coalescers ...coalesce.Coalescer) WriteGate {
 	return WriteGate{gate: newGate(store, true, coalescers)}
 }

@@ -24,10 +24,12 @@ var _ sendstate.Store = (*Store)(nil)
 // within one process; for cross-process coordination use a
 // shared-backing store (see [pith/sendstate/mongodb]).
 //
-// Construct with [New]; wire into a Protector by passing it as the
-// first argument to [pith/protect.New]. The Protector auto-sizes
-// [Store.MaxSendTimes] to the largest attached Coalescer cap via
-// [Store.GrowMaxSendTimes], so the typical caller doesn't set it.
+// Typical callers don't construct a Store directly: the
+// [pith/protect/memory.NewReadProtector] / [pith/protect/memory.NewWriteProtector]
+// factories build one internally and auto-size [Store.MaxSendTimes] to the
+// largest attached Coalescer cap via [Store.GrowMaxSendTimes]. Direct
+// construction via [New] is supported for tests or callers that need raw
+// store access.
 type Store struct {
 	// MaxSendTimes caps how many of the most recent
 	// [sendstate.Store.RecordAsSent] timestamps each key's
@@ -36,8 +38,8 @@ type Store struct {
 	// attached policy needs to observe within its window (e.g. the
 	// largest Coalescer hardCap), or [sendstate.Entry.CountSentInWindow]
 	// will undercount. Zero selects [defaultMaxSendTimes].
-	// [pith/protect.New] grows it to the largest attached cap via
-	// [Store.GrowMaxSendTimes]. Set before first use; not safe to
+	// The [pith/protect/memory] factories grow it to the largest attached
+	// cap via [Store.GrowMaxSendTimes]. Set before first use; not safe to
 	// mutate concurrently with RecordAsSent.
 	MaxSendTimes int
 
@@ -73,8 +75,8 @@ type entryRecord struct {
 // New returns a Store whose entries expire entryTTL after their last
 // write. entryTTL is required and has no default — it MUST be >= the
 // largest Coalescer window the store is used with (see the sendstate
-// package "TTL semantics" note); [pith/protect.New] validates that.
-// Panics if entryTTL <= 0.
+// package "TTL semantics" note); the [pith/protect/memory] factories
+// validate that against the attached Coalescers. Panics if entryTTL <= 0.
 func New(entryTTL time.Duration) *Store {
 	if entryTTL <= 0 {
 		panic("memory: New requires a positive entryTTL")
@@ -82,15 +84,16 @@ func New(entryTTL time.Duration) *Store {
 	return &Store{ttl: entryTTL}
 }
 
-// EntryTTL reports the configured entry TTL. [pith/protect.New] reads
-// it to validate the TTL against the attached Coalescer windows.
+// EntryTTL reports the configured entry TTL. The [pith/protect/memory]
+// factories read it to validate the TTL against the attached Coalescer
+// windows.
 func (m *Store) EntryTTL() time.Duration { return m.ttl }
 
 // GrowMaxSendTimes raises [Store.MaxSendTimes] to at least n, never
-// lowering a larger value the caller already set. [pith/protect.New]
-// calls it (via a structural interface, so it needn't import this
-// package) to size the send-timestamp list to the largest attached
-// Coalescer cap. Set before first use.
+// lowering a larger value the caller already set. The
+// [pith/protect/memory] factories call it (via a structural interface,
+// so they needn't import this package) to size the send-timestamp list
+// to the largest attached Coalescer cap. Set before first use.
 func (m *Store) GrowMaxSendTimes(n int) {
 	if n > m.MaxSendTimes {
 		m.MaxSendTimes = n

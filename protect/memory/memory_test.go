@@ -23,7 +23,7 @@ func TestNewWriteProtector(t *testing.T) {
 		coalesce.NewLeadingEdgeDebounce(debounce),
 	)
 	ctx := context.Background()
-	w := p.Namespace("") // whole-store namespace; gating happens on the handle
+	w := p.Tenant("").Namespace("") // untenanted, whole-store; gating happens on the handle
 	meta := protect.RequestMeta{TargetKey: "k1"}
 
 	// First Check proceeds (no prior send).
@@ -55,7 +55,7 @@ func TestNewReadProtector(t *testing.T) {
 		coalesce.NewLeadingEdgeDebounce(debounce),
 	)
 	ctx := context.Background()
-	r := p.Namespace("") // whole-store namespace; gating happens on the handle
+	r := p.Tenant("").Namespace("") // untenanted, whole-store; gating happens on the handle
 	meta := protect.RequestMeta{TargetKey: "k1", MessageRef: []byte("ref-1")}
 
 	// First Check proceeds.
@@ -83,11 +83,10 @@ func TestNewReadProtector(t *testing.T) {
 	}
 }
 
-// TestTenantChain verifies the chained Tenant().Namespace() API. A tenant-bound
-// handle returns a ReadNamespace / WriteNamespace of the same type as the bare
-// Namespace() call, so existing Check / RecordAsSent / ReplayCandidates code
-// paths work unchanged on top of the chain. Two tenants minted from the same
-// root protector are independent handles — neither mutates the other.
+// TestTenantChain verifies the chained Tenant().Namespace() API. Three handles
+// minted from the same root protector — two tenanted and one untenanted — each
+// compose Check + RecordAsSent + dedupe normally, confirming the chain is just
+// scoping plumbing on top of the existing gating methods.
 func TestTenantChain(t *testing.T) {
 	const debounce = 30 * time.Millisecond
 	p := memprotect.NewWriteProtector(
@@ -98,7 +97,7 @@ func TestTenantChain(t *testing.T) {
 
 	tA := p.Tenant("tenant-A").Namespace("ns")
 	tB := p.Tenant("tenant-B").Namespace("ns")
-	untenanted := p.Namespace("ns")
+	untenanted := p.Tenant("").Namespace("ns")
 
 	for _, h := range []struct {
 		name string
@@ -123,8 +122,9 @@ func TestTenantChain(t *testing.T) {
 	}
 }
 
-// TestTenantEmpty confirms Tenant("") yields an untenanted handle —
-// behaviourally indistinguishable from calling Namespace directly on the root.
+// TestTenantEmpty confirms Tenant("") yields an untenanted handle — the
+// "no outer scope" sentinel of the chain, where the resulting handle stamps
+// no tenant on its writes.
 func TestTenantEmpty(t *testing.T) {
 	p := memprotect.NewWriteProtector(time.Hour, coalesce.NewLeadingEdgeDebounce(30*time.Millisecond))
 	ctx := context.Background()

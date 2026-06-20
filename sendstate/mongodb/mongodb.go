@@ -20,23 +20,22 @@
 //   - One read drives a Check: policies read only entries; metrics is
 //     observability-only.
 //
-// Cross-instance correctness depends on the collections (or client)
-// using majority write concern, so a RecordAsSent is visible to the
-// next instance's ReadEntry; configure that on the *mongo.Database
-// passed to [New] (a w:1 default can let a racing instance miss a
-// just-recorded send).
+// Cross-instance correctness depends on the *mongo.Client (or one of its
+// derived [*mongo.Database] / [*mongo.Collection] handles) using majority
+// write concern, so a RecordAsSent is visible to the next instance's
+// ReadEntry. Configure that on the client before passing it to the
+// protect/mongodb constructors — a w:1 default can let a racing instance
+// miss a just-recorded send.
 package mongodb
 
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
-	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 
 	"github.com/homemade/pith/sendstate"
 )
@@ -113,13 +112,16 @@ var _ sendstate.Store = (*Store)(nil)
 //   - entries — TTL'd working state, one document per key.
 //   - metrics — permanent lifetime rollup (never expires).
 //
-// Construct with [New], call [Store.EnsureIndexes] once at startup,
-// then pass the Store as the first argument to [pith/protect.New].
-// Unlike the in-memory backend, the Protector does NOT auto-size
-// this Store's send-timestamp bound: pass [WithMaxSendTimes] yourself
-// (>= the largest attached Coalescer hardCap) or in-window
-// timestamps will be dropped by $slice and caps will leak. See the
-// package doc for the majority-write-concern requirement.
+// Typical callers don't construct a Store directly: the
+// [pith/protect/mongodb.NewReadProtector] / [pith/protect/mongodb.NewWriteProtector]
+// factories build one internally over a caller-owned [*mongo.Client], call
+// [Store.EnsureIndexes], and derive [WithMaxSendTimes] from the largest attached
+// Coalescer hardCap (so the storage-side bound can't be forgotten). Direct
+// construction via [New] + [Store.EnsureIndexes] is supported for tests or
+// callers that need raw store access — in that path the caller is responsible
+// for passing [WithMaxSendTimes] explicitly (>= the largest attached Coalescer
+// hardCap), or in-window timestamps will be dropped by $slice and caps will
+// leak. See the package doc for the majority-write-concern requirement.
 type Store struct {
 	entries      *mongo.Collection
 	metrics      *mongo.Collection
@@ -131,18 +133,19 @@ type Store struct {
 type Option func(*Store)
 
 // WithMaxSendTimes bounds each key's lastNSendTimes list. Set it >= the
-// largest attached Coalescer hardCap. Unlike the in-memory store,
-// [pith/protect.New] does NOT auto-size this backend (it only sizes a
-// store that opts in via a GrowMaxSendTimes method, which this one
-// deliberately doesn't), so the caller is responsible: too small a
-// bound drops in-window timestamps via $slice, making
-// [sendstate.Entry.CountSentInWindow] undercount and a cap leak.
+// largest attached Coalescer hardCap. Unlike the in-memory store, the
+// [pith/protect/mongodb] factories do NOT auto-size this backend through
+// a structural GrowMaxSendTimes hook (this Store deliberately doesn't
+// expose one) — they derive the cap from the attached Coalescers and
+// pass it via this option. Callers constructing the Store directly are
+// responsible: too small a bound drops in-window timestamps via $slice,
+// making [sendstate.Entry.CountSentInWindow] undercount and the cap leak.
 func WithMaxSendTimes(n int) Option { return func(s *Store) { s.maxSendTimes = n } }
 
 // New returns a Mongo-backed Store over the given database. entryTTL is
 // required (mirroring pith/sendstate/memory.New — pith holds no default TTL) and
-// MUST be >= the largest Coalescer window in use; [pith/protect.New]
-// validates that against the EntryTTL reported here. Panics if
+// MUST be >= the largest Coalescer window in use; the [pith/protect/mongodb]
+// factories validate that against the EntryTTL reported here. Panics if
 // entryTTL <= 0.
 //
 // The database's read/write concern is the caller's to set — see the
@@ -165,30 +168,34 @@ func New(db *mongo.Database, entryTTL time.Duration, opts ...Option) *Store {
 	return s
 }
 
-// EntryTTL reports the configured TTL so [pith/protect.New] can validate
-// it against the attached Coalescer windows.
+// EntryTTL reports the configured TTL so the [pith/protect/mongodb]
+// factories can validate it against the attached Coalescer windows.
 func (s *Store) EntryTTL() time.Duration { return s.ttl }
 
-// Config bundles the parameters [Open] needs to dial Mongo and build a
-// Store. URI and Database are deployment config (typically read from
-// the environment); EntryTTL, MaxSendTimes, and Timeout are program
-// config (typically code constants).
+// Config bundles the parameters the protect/mongodb constructors need to
+// build a Store on a caller-owned [*mongo.Client]. Database is deployment
+// config (typically read from the environment); EntryTTL and MaxSendTimes
+// are program config (typically code constants).
+//
+// The client itself is the caller's responsibility — open it with
+// [mongo.Connect] (configured with majority write concern; see the package
+// doc) and pass it into [pith/protect/mongodb.NewReadProtector] /
+// [pith/protect/mongodb.NewWriteProtector]. Connection-level concerns (URI,
+// timeouts, write concern) belong on the client, not on this Config — a
+// process sharing one client across multiple pith stores (and/or other
+// libraries) configures them once at the client.
 //
 // No JSON tags by design: callers serialize their own env-var shape
 // and map fields onto Config. That keeps pith decoupled from the
 // caller's env-var convention (flat vs composite JSON vs anything
 // else).
 type Config struct {
-	// URI is the Mongo connection string. Required. SRV strings
-	// (mongodb+srv://...) enable TLS by default; for Atlas this is
-	// the normal format.
-	URI string
-
 	// Database is the database name within the cluster. Required.
 	Database string
 
 	// EntryTTL is the working-state TTL. Required and must be >= the
-	// largest attached Coalescer window; [pith/protect.New] validates.
+	// largest attached Coalescer window; the [pith/protect/mongodb]
+	// factories validate this.
 	EntryTTL time.Duration
 
 	// MaxSendTimes bounds lastNSendTimes via $slice. Pass the largest
@@ -197,64 +204,6 @@ type Config struct {
 	// (dedupe-only floor of 1) — only sensible for callers running
 	// dedupe alone.
 	MaxSendTimes int
-
-	// Timeout caps every CRUD op (and EnsureIndexes) at this duration
-	// via the v2 driver's client-level Timeout. On a timeout
-	// [pith/protect.Protector.Check] fails open (DecisionProceed +
-	// err), so a slow Mongo degrades to over-send rather than
-	// blocking the gated path. Recommended: a tight bound (e.g.
-	// 200ms). Zero disables it.
-	Timeout time.Duration
-}
-
-// Open dials Mongo using cfg and returns a ready-to-use Store plus the
-// underlying client (so callers can Disconnect at shutdown). The client
-// is configured with majority write concern — required for
-// cross-instance correctness; see the package doc — and the configured
-// per-op Timeout if set. [Store.EnsureIndexes] is run before returning,
-// so the returned Store has TTL eviction and the RangeDeferred sort
-// index in place.
-//
-// v2's mongo.Connect is lazy (no I/O until first operation), so a
-// connectivity failure typically surfaces from EnsureIndexes rather
-// than from Connect. On any error Open returns nil Store; the client
-// is returned where possible so the caller can Disconnect if it was
-// constructed.
-func Open(ctx context.Context, cfg Config) (*Store, *mongo.Client, error) {
-	if cfg.URI == "" {
-		return nil, nil, errors.New("mongodb.Open: Config.URI is required")
-	}
-	if cfg.Database == "" {
-		return nil, nil, errors.New("mongodb.Open: Config.Database is required")
-	}
-	if cfg.EntryTTL <= 0 {
-		return nil, nil, errors.New("mongodb.Open: Config.EntryTTL is required (> 0)")
-	}
-
-	clientOpts := options.Client().
-		ApplyURI(cfg.URI).
-		SetWriteConcern(writeconcern.Majority())
-	if cfg.Timeout > 0 {
-		clientOpts = clientOpts.SetTimeout(cfg.Timeout)
-	}
-	client, err := mongo.Connect(clientOpts)
-	if err != nil {
-		return nil, nil, fmt.Errorf("mongodb.Open: connect: %w", err)
-	}
-
-	var storeOpts []Option
-	if cfg.MaxSendTimes > 0 {
-		storeOpts = append(storeOpts, WithMaxSendTimes(cfg.MaxSendTimes))
-	}
-	store := New(client.Database(cfg.Database), cfg.EntryTTL, storeOpts...)
-
-	if err := store.EnsureIndexes(ctx); err != nil {
-		// Return the client so the caller can Disconnect; the Store
-		// is nil because callers can't usefully proceed without the
-		// TTL index (entries would accumulate forever).
-		return nil, client, fmt.Errorf("mongodb.Open: EnsureIndexes: %w", err)
-	}
-	return store, client, nil
 }
 
 // EnsureIndexes creates the TTL index on expireAt, the lastDeferredAt index

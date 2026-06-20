@@ -89,12 +89,13 @@
 //     Never split such streams by key prefix; the collection boundary is the
 //     only isolation that keeps their replay logic apart.
 //
-//   - NAMESPACES (pick one with Namespace(ns)) for many streams with the SAME
-//     consumer that share a store but must be swept fairly. A namespace-scoped
-//     sweep applies limit and the oldest-first ordering within the namespace,
-//     so one namespace's backlog can't head-of-line-block another's. It
-//     narrows only along the namespace axis; it is not a substitute for
-//     separate stores across consumers. The "" namespace is the whole store.
+//   - NAMESPACES (pick one with .Tenant(t).Namespace(ns), where t may be "")
+//     for many streams with the SAME consumer that share a store but must be
+//     swept fairly. A namespace-scoped sweep applies limit and the oldest-first
+//     ordering within the namespace, so one namespace's backlog can't
+//     head-of-line-block another's. It narrows only along the namespace axis;
+//     it is not a substitute for separate stores across consumers. The ""
+//     namespace is the whole store.
 //
 //   - TENANTS (chain with Tenant(t).Namespace(ns)) as an optional OUTER scope
 //     above the namespace. Tenant is a labelling field — stamped on every
@@ -102,8 +103,8 @@
 //     per-tenant aggregation — but it does NOT scope the replay sweep or
 //     isolate TargetKeys. If two tenants must use the same namespace name and
 //     need distinct keys, include the tenant in TargetKey explicitly; pith
-//     does not derive keys from Tenant. Tenant("") is the untenanted handle,
-//     equivalent to calling Namespace directly on the root protector.
+//     does not derive keys from Tenant. Tenant("") is the untenanted handle —
+//     the "no outer scope" sentinel of the chain.
 //
 // # Construction
 //
@@ -122,20 +123,26 @@
 //
 // # Check / RecordAsSent contract
 //
-// Write happy-path (against the Mongo factory):
+// Write happy-path (against the Mongo factory). The client is the caller's —
+// open it with mongo.Connect (configured with majority write concern; see
+// [pith/sendstate/mongodb]), share it across pith stores or other libraries,
+// and Disconnect at shutdown:
 //
-//	p, client, err := pmongo.NewWriteProtector(ctx, pmongo.Config{
-//	    URI: ..., Database: ..., EntryTTL: 48*time.Hour,
+//	client, err := mongo.Connect(options.Client().ApplyURI(uri).SetWriteConcern(writeconcern.Majority()))
+//	if err != nil { ... }
+//	defer client.Disconnect(ctx)
+//
+//	p, err := pmongo.NewWriteProtector(ctx, client, pmongo.Config{
+//	    Database: ..., EntryTTL: 48*time.Hour,
 //	},
 //	    coalesce.NewQuota(50, 24*time.Hour),
 //	    coalesce.NewLeadingEdgeDebounce(10*time.Second),
 //	)
 //	if err != nil { ... }
-//	defer client.Disconnect(ctx)
 //
 //	// Scope: outer Tenant for observability, inner Namespace for the sweep.
-//	// Drop Tenant if you don't need a labelled outer scope; use Namespace("")
-//	// for the whole-store namespace.
+//	// Use Tenant("") for the untenanted handle and Namespace("") for the
+//	// whole-store namespace.
 //	w := p.Tenant(orgID).Namespace(campaignID)
 //	meta := protect.RequestMeta{TargetKey: activityID + ":" + contactID, MessageRef: ref}
 //	out := w.Check(ctx, meta, contentHash)
@@ -156,7 +163,7 @@
 // A read gate is the same shape without the hash and with no Deduped arm —
 // a capped read defers (and a sweep replays it) rather than dropping:
 //
-//	r := readProtector.Tenant(orgID).Namespace(campaignID) // or just .Namespace(...)
+//	r := readProtector.Tenant(orgID).Namespace(campaignID) // Tenant("") for untenanted
 //	out := r.Check(ctx, meta)
 //	switch out.Decision {
 //	case protect.DecisionProceed:

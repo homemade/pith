@@ -12,12 +12,16 @@
 // deriving the value from the attached Coalescers — the same ones that
 // drive Check's policy evaluation.
 //
-// Both constructors require at least one Coalescer (the (first, rest...)
-// shape).
+// Both constructors require a caller-owned [*mongo.Client] (configured
+// with majority write concern; see [pith/sendstate/mongodb]) and at least
+// one Coalescer (the (first, rest...) shape). The client is the caller's
+// to share across pith stores or other libraries and to Disconnect at
+// shutdown.
 package mongodb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -34,21 +38,21 @@ type Config = mongostore.Config
 
 // NewReadProtector returns a [pith/protect.ReadProtector] backed by an
 // Atlas mongo store (coalesce caps only, no content dedupe; capped Checks
-// DEFER and are replayable via ReplayCandidates), plus the underlying
-// *mongo.Client (so callers can Disconnect at shutdown), or an error.
-// MaxSendTimes is handled as described on [NewWriteProtector].
-func NewReadProtector(ctx context.Context, cfg Config, first coalesce.Coalescer, rest ...coalesce.Coalescer) (protect.ReadProtector, *mongo.Client, error) {
+// DEFER and are replayable via ReplayCandidates) on the caller-owned
+// client, or an error. MaxSendTimes is handled as described on
+// [NewWriteProtector].
+func NewReadProtector(ctx context.Context, client *mongo.Client, cfg Config, first coalesce.Coalescer, rest ...coalesce.Coalescer) (protect.ReadProtector, error) {
 	coalescers := append([]coalesce.Coalescer{first}, rest...)
-	store, client, err := open(ctx, cfg, coalescers)
+	store, err := open(ctx, client, cfg, coalescers)
 	if err != nil {
-		return nil, client, err
+		return nil, err
 	}
-	return core.NewRead(store, coalescers...), client, nil
+	return core.NewRead(store, coalescers...), nil
 }
 
 // NewWriteProtector returns a [pith/protect.WriteProtector] backed by an
-// Atlas mongo store (content dedupe + coalesce caps, capped Checks DEFER),
-// plus the underlying *mongo.Client, or an error.
+// Atlas mongo store (content dedupe + coalesce caps, capped Checks DEFER)
+// on the caller-owned client, or an error.
 //
 // MaxSendTimes handling — the reason these wrappers exist:
 //
@@ -60,27 +64,48 @@ func NewReadProtector(ctx context.Context, cfg Config, first coalesce.Coalescer,
 //     silently leak the cap via $slice, so we surface the misconfiguration
 //     at construction.
 //
-// All other Config fields (URI, Database, EntryTTL, Timeout) follow
-// [pith/sendstate/mongodb.Open]'s semantics — see its godoc.
-func NewWriteProtector(ctx context.Context, cfg Config, first coalesce.Coalescer, rest ...coalesce.Coalescer) (protect.WriteProtector, *mongo.Client, error) {
+// Other Config fields (Database, EntryTTL) are validated here; see
+// [pith/sendstate/mongodb.Config] for their semantics. The client itself is
+// the caller's — open it with [mongo.Connect] configured for majority write
+// concern (see the [pith/sendstate/mongodb] package doc) and Disconnect at
+// shutdown.
+func NewWriteProtector(ctx context.Context, client *mongo.Client, cfg Config, first coalesce.Coalescer, rest ...coalesce.Coalescer) (protect.WriteProtector, error) {
 	coalescers := append([]coalesce.Coalescer{first}, rest...)
-	store, client, err := open(ctx, cfg, coalescers)
+	store, err := open(ctx, client, cfg, coalescers)
 	if err != nil {
-		return nil, client, err
+		return nil, err
 	}
-	return core.NewWrite(store, coalescers...), client, nil
+	return core.NewWrite(store, coalescers...), nil
 }
 
-// open sizes MaxSendTimes from the coalescers and opens the store. On
-// EnsureIndexes failure mongostore.Open returns a non-nil client so the
-// caller can Disconnect; that client is surfaced here too.
-func open(ctx context.Context, cfg Config, coalescers []coalesce.Coalescer) (*mongostore.Store, *mongo.Client, error) {
+// open sizes MaxSendTimes from the coalescers, builds the store over the
+// caller's client, and ensures the indexes are in place.
+func open(ctx context.Context, client *mongo.Client, cfg Config, coalescers []coalesce.Coalescer) (*mongostore.Store, error) {
+	if client == nil {
+		return nil, errors.New("mongodb: client is required")
+	}
+	if cfg.Database == "" {
+		return nil, errors.New("mongodb: Config.Database is required")
+	}
+	if cfg.EntryTTL <= 0 {
+		return nil, errors.New("mongodb: Config.EntryTTL is required (> 0)")
+	}
+
 	derived := core.LargestHardCap(coalescers...)
 	switch {
 	case cfg.MaxSendTimes == 0:
 		cfg.MaxSendTimes = derived
 	case cfg.MaxSendTimes < derived:
-		return nil, nil, fmt.Errorf("mongodb: Config.MaxSendTimes (%d) is below the largest attached Coalescer hardCap (%d) — would silently leak the cap via $slice", cfg.MaxSendTimes, derived)
+		return nil, fmt.Errorf("mongodb: Config.MaxSendTimes (%d) is below the largest attached Coalescer hardCap (%d) — would silently leak the cap via $slice", cfg.MaxSendTimes, derived)
 	}
-	return mongostore.Open(ctx, cfg)
+
+	var storeOpts []mongostore.Option
+	if cfg.MaxSendTimes > 0 {
+		storeOpts = append(storeOpts, mongostore.WithMaxSendTimes(cfg.MaxSendTimes))
+	}
+	store := mongostore.New(client.Database(cfg.Database), cfg.EntryTTL, storeOpts...)
+	if err := store.EnsureIndexes(ctx); err != nil {
+		return nil, fmt.Errorf("mongodb: EnsureIndexes: %w", err)
+	}
+	return store, nil
 }

@@ -215,7 +215,7 @@ func TestWriteGateScenarios(t *testing.T) {
 		&recordingCap{inner: innerQuota, rec: rec, name: "Quota"},
 	)
 	rec.Exit([]any{"core.WriteGate"})
-	pr := &recordingProtector{inner: p.Namespace(""), rec: rec}
+	pr := &recordingProtector{inner: p.Tenant("").Namespace(""), rec: rec}
 
 	rec.Run(t, scenario1, func(t *testing.T) {
 		meta := protect.RequestMeta{TargetKey: "act-1:contact-1", MessageRef: []byte("activity-A")}

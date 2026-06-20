@@ -111,39 +111,46 @@ type Outcome struct {
 	Err error
 }
 
-// ReadProtector is the base read-side gate for content-free operations — a
+// ReadProtector is the root read-side gate for content-free operations — a
 // read, poll, inbound event, or fire-and-forget trigger — with one or more
-// coalesce cap policies and no content dedupe. It is a factory only: pick a
-// namespace with [ReadProtector.Namespace] to get a [ReadNamespace], where the
-// gating happens (like selecting a Mongo collection off a database). "" is the
-// whole-store namespace — the single entry point even when you don't scope.
-// Construct via [pith/protect/memory.NewReadProtector] or
+// coalesce cap policies and no content dedupe. It is a factory only: bind a
+// tenant with [ReadProtector.Tenant] to get a [ReadTenant], then pick a
+// namespace with [ReadTenant.Namespace] to get a [ReadNamespace], where the
+// gating happens (like selecting a Mongo collection off a database). Tenant("")
+// is the "no outer scope" sentinel and Namespace("") is the whole-store
+// namespace — the chain is the single entry point even when you don't scope
+// either layer. Construct via [pith/protect/memory.NewReadProtector] or
 // [pith/protect/mongodb.NewReadProtector].
 //
-// An optional outer scope is available via [ReadProtector.Tenant], yielding a
-// tenant-bound ReadProtector that stamps the tenant on every Entry / Metrics
-// write taken through its Namespace handle. Tenant is a labelling field for
-// observability and per-tenant queries — it does not isolate TargetKeys or
-// scope the [ReadNamespace.ReplayCandidates] sweep (still namespace-scoped).
+// The tenant is a labelling field for observability and per-tenant queries —
+// it does not isolate TargetKeys or scope the
+// [ReadNamespace.ReplayCandidates] sweep (still namespace-scoped).
 type ReadProtector interface {
+	// Tenant returns a [ReadTenant] bound to t as the outer scope. Calling
+	// [ReadTenant.Namespace] on the returned handle mints a [ReadNamespace]
+	// that stamps t on every entry / Metrics doc it writes. The original
+	// ReadProtector is unaffected — Tenant produces a fresh handle rather
+	// than mutating shared state, so two tenants can be served from the
+	// same root protector.
+	//
+	// Tenant("") is the untenanted handle: the empty string is the "no
+	// outer scope" sentinel, consistent with how Namespace("") is the
+	// whole-store namespace.
+	Tenant(t string) ReadTenant
+}
+
+// ReadTenant is a [ReadProtector] bound to one tenant — the middle step in
+// the Tenant → Namespace chain. Pick a namespace with [ReadTenant.Namespace]
+// to get a [ReadNamespace], where Check / RecordAsSent / ReplayCandidates run.
+// Namespace handles minted from this ReadTenant stamp the bound tenant on
+// every entry / Metrics doc they write.
+type ReadTenant interface {
 	// Namespace returns a [ReadNamespace] scoped to ns ("" = the whole
 	// store). The returned handle is where gating happens — Check /
-	// RecordAsSent / ReplayCandidates all operate within ns. When invoked
-	// on a Tenant-bound ReadProtector, the resulting handle stamps both
-	// tenant and namespace on every write it commits.
+	// RecordAsSent / ReplayCandidates all operate within ns and stamp the
+	// tenant bound on this ReadTenant alongside the namespace on every
+	// write they commit.
 	Namespace(ns string) ReadNamespace
-
-	// Tenant returns a new ReadProtector bound to t as the outer scope.
-	// Calling [ReadProtector.Namespace] on the returned protector mints a
-	// [ReadNamespace] that stamps t on every entry / Metrics doc it
-	// writes. The original ReadProtector is unaffected — Tenant produces a
-	// fresh handle rather than mutating shared state, so two tenants can
-	// be served from the same root protector.
-	//
-	// Tenant("") is equivalent to the untenanted root: the empty string
-	// is the "no outer scope" sentinel, consistent with how Namespace("")
-	// is the whole-store namespace.
-	Tenant(t string) ReadProtector
 }
 
 // ReadNamespace is a [ReadProtector] scoped to one namespace — where reads are
@@ -159,31 +166,35 @@ type ReadNamespace interface {
 	ReplayCandidates(ctx context.Context, limit int) ([]DeferredRequest, error)
 }
 
-// WriteProtector is the base write-side gate for content-bearing operations — a
-// send/merge/PATCH — with content dedupe plus one or more coalesce cap policies.
-// Like [ReadProtector] it is a factory only: pick a namespace with
-// [WriteProtector.Namespace] to get a [WriteNamespace]. Construct via
-// [pith/protect/memory.NewWriteProtector] or [pith/protect/mongodb.NewWriteProtector].
-//
-// An optional outer scope is available via [WriteProtector.Tenant], yielding a
-// tenant-bound WriteProtector that stamps the tenant on every Entry / Metrics
-// write taken through its Namespace handle. See [ReadProtector] for the
+// WriteProtector is the root write-side gate for content-bearing operations —
+// a send/merge/PATCH — with content dedupe plus one or more coalesce cap
+// policies. Like [ReadProtector] it is a factory only: bind a tenant with
+// [WriteProtector.Tenant] to get a [WriteTenant], then pick a namespace with
+// [WriteTenant.Namespace] to get a [WriteNamespace], where the gating happens.
+// Construct via [pith/protect/memory.NewWriteProtector] or
+// [pith/protect/mongodb.NewWriteProtector]. See [ReadProtector] for the
 // labelling-vs-isolation contract — it applies identically here.
 type WriteProtector interface {
-	// Namespace returns a [WriteNamespace] scoped to ns ("" = the whole
-	// store). The returned handle is where gating happens. When invoked on
-	// a Tenant-bound WriteProtector, the resulting handle stamps both
-	// tenant and namespace on every write it commits.
-	Namespace(ns string) WriteNamespace
-
-	// Tenant returns a new WriteProtector bound to t as the outer scope.
-	// Calling [WriteProtector.Namespace] on the returned protector mints a
-	// [WriteNamespace] that stamps t on every entry / Metrics doc it
-	// writes. The original WriteProtector is unaffected — Tenant produces
-	// a fresh handle rather than mutating shared state.
+	// Tenant returns a [WriteTenant] bound to t as the outer scope. Calling
+	// [WriteTenant.Namespace] on the returned handle mints a [WriteNamespace]
+	// that stamps t on every entry / Metrics doc it writes. The original
+	// WriteProtector is unaffected — Tenant produces a fresh handle rather
+	// than mutating shared state.
 	//
-	// Tenant("") is equivalent to the untenanted root.
-	Tenant(t string) WriteProtector
+	// Tenant("") is the untenanted handle.
+	Tenant(t string) WriteTenant
+}
+
+// WriteTenant is a [WriteProtector] bound to one tenant — the middle step in
+// the Tenant → Namespace chain. Pick a namespace with [WriteTenant.Namespace]
+// to get a [WriteNamespace]. Namespace handles minted from this WriteTenant
+// stamp the bound tenant on every entry / Metrics doc they write.
+type WriteTenant interface {
+	// Namespace returns a [WriteNamespace] scoped to ns ("" = the whole
+	// store). The returned handle is where gating happens and stamps the
+	// tenant bound on this WriteTenant alongside the namespace on every
+	// write it commits.
+	Namespace(ns string) WriteNamespace
 }
 
 // WriteNamespace is a [WriteProtector] scoped to one namespace — where writes

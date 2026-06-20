@@ -111,7 +111,7 @@ func TestReadGateScenarios(t *testing.T) {
 		&recordingCap{inner: innerDebounce, rec: rec, name: "Debounce"},
 	)
 	rec.Exit([]any{"core.ReadGate"})
-	pr := &recordingReadProtector{inner: p.Namespace(""), rec: rec}
+	pr := &recordingReadProtector{inner: p.Tenant("").Namespace(""), rec: rec}
 
 	rec.Run(t, scenario1, func(t *testing.T) {
 		meta := protect.RequestMeta{TargetKey: "campaign-1:webhooks:profile-1", MessageRef: []byte("profile-1@v1")}

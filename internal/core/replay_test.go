@@ -19,7 +19,7 @@ func TestWriteGate_ReplayCandidates(t *testing.T) {
 	w := core.NewWrite(
 		memory.New(time.Hour),
 		coalesce.NewLeadingEdgeDebounce(debounce),
-	).Namespace("") // whole-store namespace; gating happens on the handle
+	).Tenant("").Namespace("") // untenanted, whole-store; gating happens on the handle
 	meta := protect.RequestMeta{TargetKey: "k1", MessageRef: []byte("ref")}
 
 	// First send proceeds and is recorded.
