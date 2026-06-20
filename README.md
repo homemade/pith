@@ -122,5 +122,5 @@ external consumers.
 Consumers pin via Go modules:
 
 ```
-require github.com/homemade/pith v1.6.0
+require github.com/homemade/pith v1.7.0
 ```
