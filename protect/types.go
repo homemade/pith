@@ -90,6 +90,20 @@ func (d Decision) String() string {
 	}
 }
 
+// ReleaseFunc rolls back the optimistic reserve made by a Proceed
+// [WriteNamespace.CheckAndReserve] / [ReadNamespace.CheckAndReserve] when
+// the gated operation subsequently fails. It pops the reserved
+// send-timestamp from the entry's send-time list (by value, so concurrent
+// sibling reserves aren't clobbered) but does not roll back lifetime
+// metrics — see the sendstate package doc. Best-effort: a backing-store
+// error is returned for logging but the slot leaks until the trailing
+// window slides it out.
+//
+// nil on non-Proceed outcomes (Deduped / Deferred): there is no
+// reservation to release. Callers should pattern-match on Outcome.Decision
+// and only invoke the release on the Proceed branch's op-failure path.
+type ReleaseFunc func(ctx context.Context) error
+
 // Outcome reports a Check result. Decision is always actionable; Err carries any
 // backing-store failure encountered along the way (so a caller can log it
 // without losing the policy outcome).
@@ -164,6 +178,28 @@ type ReadNamespace interface {
 	Check(ctx context.Context, meta RequestMeta) Outcome
 	RecordAsSent(ctx context.Context, meta RequestMeta) error
 	ReplayCandidates(ctx context.Context, limit int) ([]DeferredRequest, error)
+
+	// CheckAndReserve is the atomic cap-discipline counterpart to Check
+	// + RecordAsSent: a single round-trip that evaluates every attached
+	// Coalescer and — on a Proceed — reserves a send-slot for the caller
+	// before they perform the gated read. The returned ReleaseFunc rolls
+	// the reservation back on op failure.
+	//
+	// Two outcomes (DecisionProceed / DecisionDeferred) — never
+	// DecisionDeduped, because the read gate has no content to fingerprint.
+	// On a Deferred outcome the deferred breadcrumb is stamped, just as
+	// Check would: a consumer-side sweep (ReplayCandidates) re-takes the
+	// read once the cap clears.
+	//
+	// Fail-policy: a backing-store error returns DecisionDeferred + non-nil
+	// Outcome.Err (fail-closed — the replay sweep re-drives). Distinct from
+	// Check, which fails open. Use this method when the cap discipline
+	// matters (no overshoot tolerated) and accept the fail-closed posture.
+	//
+	// ReleaseFunc is nil on Deferred. On Proceed it is non-nil; the caller
+	// invokes it only when the gated read subsequently fails — a successful
+	// read leaves the reserve in place as the canonical "record of read."
+	CheckAndReserve(ctx context.Context, meta RequestMeta) (Outcome, ReleaseFunc)
 }
 
 // WriteProtector is the root write-side gate for content-bearing operations —
@@ -207,4 +243,28 @@ type WriteNamespace interface {
 	Check(ctx context.Context, meta RequestMeta, contentHash string) Outcome
 	RecordAsSent(ctx context.Context, meta RequestMeta, contentHash string) error
 	ReplayCandidates(ctx context.Context, limit int) ([]DeferredRequest, error)
+
+	// CheckAndReserve is the atomic cap-discipline counterpart to Check
+	// + RecordAsSent: a single round-trip that evaluates dedupe and every
+	// attached Coalescer and — on a Proceed — reserves a send-slot for the
+	// caller before they perform the gated write. The returned ReleaseFunc
+	// rolls the reservation back on op failure.
+	//
+	// Three outcomes (DecisionProceed / DecisionDeduped / DecisionDeferred),
+	// matching Check. On a Deduped outcome the caller drops the operation;
+	// on a Deferred outcome the deferred breadcrumb is stamped (just as
+	// Check would), and a consumer-side sweep (ReplayCandidates) re-emits
+	// once the cap clears.
+	//
+	// Fail-policy: a backing-store error returns DecisionDeferred + non-nil
+	// Outcome.Err (fail-closed — the replay sweep re-drives). Distinct from
+	// Check, which fails open. Use this method when cap discipline matters
+	// (no overshoot tolerated, e.g. a hard downstream quota) and accept the
+	// fail-closed posture; use Check + RecordAsSent when an advisory cap is
+	// enough and the legacy fail-open is preferred.
+	//
+	// ReleaseFunc is nil on Deduped / Deferred. On Proceed it is non-nil;
+	// the caller invokes it only on op failure — a successful op leaves the
+	// reserve as the canonical "record of send."
+	CheckAndReserve(ctx context.Context, meta RequestMeta, contentHash string) (Outcome, ReleaseFunc)
 }

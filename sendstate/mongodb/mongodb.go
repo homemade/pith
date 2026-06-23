@@ -31,12 +31,14 @@ package mongodb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"github.com/homemade/pith/coalesce"
 	"github.com/homemade/pith/sendstate"
 )
 
@@ -355,6 +357,344 @@ func (s *Store) RecordAsDeferred(ctx context.Context, key, tenant, namespace str
 	// $min on firstDeferredAt — set-once semantics symmetric with
 	// firstSentAt on RecordAsSent. See that method's comment.
 	_, err = s.metrics.UpdateByID(ctx, key, bson.M{
+		"$inc": bson.M{"totalDeferred": 1},
+		"$set": bson.M{"lastDeferredAt": now, "tenant": tenant, "namespace": namespace},
+		"$min": bson.M{"firstDeferredAt": now},
+	}, options.UpdateOne().SetUpsert(true))
+	return err
+}
+
+// CheckAndReserve runs the atomic check-and-reserve aggregation pipeline
+// against the entries collection: a single `findOneAndUpdate` computes the
+// outcome (Deduped / Deferred / Proceed) from the pre-update document and
+// conditionally applies the matching writes inline. The post-update
+// document is read back for the outcome fields. The metrics doc is
+// updated in a separate round-trip (same shape as RecordAsSent —
+// observability writes never block the gate).
+//
+// Pipeline shape (compact):
+//
+//	[ {$set: outcomeFlag, outcomeReason}   // computes the policy verdict
+//	, {$set: entry writes + reservedAt}    // conditional pushes / sets
+//	]
+//
+// The pre-update document state drives every flag, so concurrent reserves
+// serialise on the single-document write lock — the second one's $size
+// over $lastNSendTimes already includes the first's just-pushed timestamp.
+// Strict cap behaviour follows.
+//
+// Fail-policy: a backing-store error returns Deferred + non-nil err
+// (fail-closed — the replay sweep re-drives). Callers MUST treat the
+// Decision regardless of err.
+func (s *Store) CheckAndReserve(ctx context.Context, req sendstate.ReserveRequest, messageRef []byte) (sendstate.ReserveResult, error) {
+	if len(req.Coalescers) == 0 {
+		return sendstate.ReserveResult{Deferred: true, Reason: "configuration error"},
+			errors.New("mongodb: CheckAndReserve requires at least one Coalescer")
+	}
+
+	deferReasonExpr, err := composeDeferReasonExpr(req.Coalescers)
+	if err != nil {
+		return sendstate.ReserveResult{Deferred: true, Reason: "configuration error"}, err
+	}
+
+	now := time.Now()
+
+	// Dedupe expression: true iff lastContentHash equals the incoming
+	// hash AND a send-timestamp is currently recorded for this key. The
+	// lastNSendTimes-non-empty guard mirrors the memory backend's
+	// [sendstate.Entry.Seen] semantics: contentHash is preserved through
+	// a [Store.ReleaseReservation] (release pops the timestamp by value
+	// only, not the hash), so without this guard a wire failure followed
+	// by an identical retry would be incorrectly dedupe-suppressed. With
+	// the guard, an empty lastNSendTimes — whether from a release, a
+	// brand-new key, or a TTL-swept entry — leaves the dedupe gate inert
+	// and the retry proceeds, matching the record-on-success invariant
+	// callers rely on. Read gates pass an empty ContentHash so dedupe is
+	// wired off; the Deduped outcome is then unreachable.
+	var dedupedExpr any
+	if req.ContentHash != "" {
+		dedupedExpr = bson.M{"$and": bson.A{
+			bson.M{"$eq": bson.A{"$contentHash", req.ContentHash}},
+			bson.M{"$gt": bson.A{
+				bson.M{"$size": bson.M{"$ifNull": bson.A{"$lastNSendTimes", bson.A{}}}},
+				0,
+			}},
+		}}
+	} else {
+		dedupedExpr = false
+	}
+
+	// Stage 1 — compute the outcome flag + reason as fields on the doc.
+	// Order: deduped beats deferred beats proceed (matches Check's layer
+	// order). Later stages reference these.
+	stage1 := bson.M{
+		"_reserveOutcome": bson.M{"$cond": bson.A{
+			dedupedExpr, "deduped",
+			bson.M{"$cond": bson.A{
+				bson.M{"$ne": bson.A{deferReasonExpr, ""}},
+				"deferred",
+				"proceed",
+			}},
+		}},
+		"_reserveReason": bson.M{"$cond": bson.A{
+			dedupedExpr, "duplicate content",
+			deferReasonExpr, // "" on Proceed; coalescer name on Deferred
+		}},
+	}
+
+	// Stage 2 — apply the conditional writes based on the outcome.
+	//
+	//   - Proceed: push $$NOW onto lastNSendTimes (sliced), set
+	//     contentHash (write side only), stamp lastSentAt, snapshot
+	//     _reservedAt for the caller.
+	//   - Deferred: push $$NOW onto lastNDeferredTimes (sliced), set
+	//     lastDeferredMessageRef + lastDeferredAt.
+	//   - Deduped: no field writes beyond the always-set scope fields.
+	//
+	// Every "$cond" branch preserves the pre-update value via $ifNull so
+	// upserts of a brand-new doc don't materialise nulls.
+	isProceed := bson.M{"$eq": bson.A{"$_reserveOutcome", "proceed"}}
+	isDeferred := bson.M{"$eq": bson.A{"$_reserveOutcome", "deferred"}}
+
+	pushedSendTimes := bson.M{"$slice": bson.A{
+		bson.M{"$concatArrays": bson.A{
+			bson.M{"$ifNull": bson.A{"$lastNSendTimes", bson.A{}}},
+			bson.A{"$$NOW"},
+		}},
+		-s.maxSendTimes,
+	}}
+	pushedDeferredTimes := bson.M{"$slice": bson.A{
+		bson.M{"$concatArrays": bson.A{
+			bson.M{"$ifNull": bson.A{"$lastNDeferredTimes", bson.A{}}},
+			bson.A{"$$NOW"},
+		}},
+		-s.maxSendTimes,
+	}}
+
+	stage2 := bson.M{
+		"tenant":    req.Tenant,
+		"namespace": req.Namespace,
+		"expireAt":  bson.M{"$add": bson.A{"$$NOW", s.ttl.Milliseconds()}},
+
+		"lastNSendTimes": bson.M{"$cond": bson.A{
+			isProceed,
+			pushedSendTimes,
+			bson.M{"$ifNull": bson.A{"$lastNSendTimes", bson.A{}}},
+		}},
+		"lastSentAt": bson.M{"$cond": bson.A{
+			isProceed, "$$NOW", "$lastSentAt",
+		}},
+		"_reservedAt": bson.M{"$cond": bson.A{
+			isProceed, "$$NOW", nil,
+		}},
+
+		"lastNDeferredTimes": bson.M{"$cond": bson.A{
+			isDeferred,
+			pushedDeferredTimes,
+			bson.M{"$ifNull": bson.A{"$lastNDeferredTimes", bson.A{}}},
+		}},
+		"lastDeferredMessageRef": bson.M{"$cond": bson.A{
+			isDeferred, messageRef, "$lastDeferredMessageRef",
+		}},
+		"lastDeferredAt": bson.M{"$cond": bson.A{
+			isDeferred, "$$NOW", "$lastDeferredAt",
+		}},
+	}
+
+	// Write side updates contentHash on a Proceed (the reserve is the
+	// optimistic record — Release does not roll this back). Read side
+	// passes ContentHash == "" and we don't touch the field at all.
+	if req.ContentHash != "" {
+		stage2["contentHash"] = bson.M{"$cond": bson.A{
+			isProceed, req.ContentHash, "$contentHash",
+		}}
+	}
+
+	pipeline := mongo.Pipeline{
+		{{Key: "$set", Value: stage1}},
+		{{Key: "$set", Value: stage2}},
+	}
+
+	// Decode shape — superset of entryDoc with the outcome fields.
+	var doc reserveOutcomeDoc
+	err = s.entries.FindOneAndUpdate(ctx, bson.M{"_id": req.Key}, pipeline,
+		options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After),
+	).Decode(&doc)
+	if err != nil {
+		// Fail-closed: surface Deferred so the replay sweep re-drives.
+		return sendstate.ReserveResult{Deferred: true, Reason: "store error"}, err
+	}
+
+	switch doc.ReserveOutcome {
+	case "deduped":
+		return sendstate.ReserveResult{Deduped: true, Reason: "duplicate content"}, nil
+	case "deferred":
+		// Update deferred-side metrics; failure here doesn't change the
+		// gate decision (observability only).
+		if mErr := s.bumpDeferredMetrics(ctx, req.Key, req.Tenant, req.Namespace); mErr != nil {
+			return sendstate.ReserveResult{Deferred: true, Reason: doc.ReserveReason}, mErr
+		}
+		return sendstate.ReserveResult{Deferred: true, Reason: doc.ReserveReason}, nil
+	case "proceed":
+		// Update sent-side metrics + peaks using the post-update entry
+		// (so the rolling-window counts include the just-pushed timestamp).
+		if mErr := s.bumpSentMetrics(ctx, req.Key, req.Tenant, req.Namespace, now, doc.entry()); mErr != nil {
+			return sendstate.ReserveResult{ReservedAt: doc.ReservedAt}, mErr
+		}
+		return sendstate.ReserveResult{ReservedAt: doc.ReservedAt}, nil
+	default:
+		// Should never happen — fail closed.
+		return sendstate.ReserveResult{Deferred: true, Reason: "store error"},
+			errors.New("mongodb: unexpected reserve outcome: " + doc.ReserveOutcome)
+	}
+}
+
+// ReleaseReservation pops the reservedAt timestamp from the key's
+// lastNSendTimes via `$pull` (by value). Lifetime metrics are not rolled
+// back — see the sendstate package doc.
+//
+// Best-effort: a missing document or missing timestamp is silently a
+// no-op; only a backing-store error surfaces.
+func (s *Store) ReleaseReservation(ctx context.Context, key string, reservedAt time.Time) error {
+	_, err := s.entries.UpdateByID(ctx, key, bson.M{
+		"$pull": bson.M{"lastNSendTimes": reservedAt},
+	})
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil
+	}
+	return err
+}
+
+// reserveOutcomeDoc decodes the post-update entry doc with the two extra
+// fields the CheckAndReserve pipeline stamps. Inherits all entryDoc shape
+// via embedding.
+type reserveOutcomeDoc struct {
+	entryDoc       `bson:",inline"`
+	ReserveOutcome string    `bson:"_reserveOutcome,omitempty"`
+	ReserveReason  string    `bson:"_reserveReason,omitempty"`
+	ReservedAt     time.Time `bson:"_reservedAt,omitempty"`
+}
+
+// composeDeferReasonExpr builds the chained $cond that returns the firing
+// Coalescer's Name (string), or "" when none fire. Order follows the
+// caller's attached order — the first Coalescer that defers wins.
+//
+// Every Coalescer.Strategy must map to a non-nil [mongoExpr]; the
+// switch is exhaustive over the strategies coalesce ships, so a nil
+// here is a "your build is incoherent" diagnostic rather than a runtime
+// concern.
+func composeDeferReasonExpr(coalescers []coalesce.Coalescer) (any, error) {
+	// Build from the tail forward: each Coalescer's $cond wraps the
+	// chain so far in its else-branch.
+	expr := any("") // empty-string sentinel for "no Coalescer deferred"
+	for i := len(coalescers) - 1; i >= 0; i-- {
+		me := mongoExpr(coalescers[i])
+		if me == nil {
+			return nil, errors.New("mongodb: CheckAndReserve: Coalescer " + coalescers[i].Name() + " has no Mongo expression — unknown Strategy")
+		}
+		expr = bson.M{"$cond": bson.A{bson.M(me), coalescers[i].Name(), expr}}
+	}
+	return expr, nil
+}
+
+// mongoExpr returns the Mongo aggregation expression that evaluates to
+// true iff c would defer at the server's `$$NOW`. Switches on
+// [coalesce.Coalescer.Strategy] — the in-process backend uses the
+// Go-side mirror, [coalesce.Coalescer.ShouldDefer]. Panics on an
+// unknown Strategy, matching the coalesce package's switch policy —
+// every [coalesce.Coalescer] reaching this point should originate from
+// one of the package's New* constructors.
+func mongoExpr(c coalesce.Coalescer) sendstate.MongoExpr {
+	switch c.Strategy {
+	case coalesce.StrategyLeadingEdge, coalesce.StrategyQuota:
+		return sendstate.MongoExpr{
+			"$gte": []any{
+				countInTrailingWindow("$lastNSendTimes", c.Window),
+				c.HardCap,
+			},
+		}
+	case coalesce.StrategyTrailingEdge:
+		return sendstate.MongoExpr{
+			"$or": []any{
+				map[string]any{"$gt": []any{
+					countInTrailingWindow("$lastNSendTimes", c.Window), 0,
+				}},
+				map[string]any{"$gt": []any{
+					countInTrailingWindow("$lastNDeferredTimes", c.Window), 0,
+				}},
+			},
+		}
+	default:
+		panic(fmt.Sprintf("mongodb: unknown coalesce.Strategy %d — construct Coalescers via the coalesce package's New* constructors", c.Strategy))
+	}
+}
+
+// countInTrailingWindow renders `$size($filter(... > $$NOW - windowMs))`
+// — the server-side equivalent of [sendstate.Entry.CountSentInWindow]
+// (or CountDeferredInWindow, depending on the field). `$ifNull` defaults
+// a missing array field to `[]` so a first-time key (no document yet, or
+// no sends recorded yet) counts as zero rather than erroring.
+func countInTrailingWindow(field string, window time.Duration) any {
+	return map[string]any{
+		"$size": map[string]any{
+			"$filter": map[string]any{
+				"input": map[string]any{"$ifNull": []any{field, []any{}}},
+				"cond": map[string]any{
+					"$gt": []any{
+						"$$this",
+						map[string]any{"$subtract": []any{"$$NOW", window.Milliseconds()}},
+					},
+				},
+			},
+		},
+	}
+}
+
+// bumpSentMetrics is the metrics-doc update for a Proceed CheckAndReserve.
+// Mirrors RecordAsSent's pipeline-update over the same metrics fields,
+// using the post-update entry's send-time list for accurate rolling-window
+// peak counts.
+func (s *Store) bumpSentMetrics(ctx context.Context, key, tenant, namespace string, now time.Time, ent sendstate.Entry) error {
+	if s.maxSendTimes <= 1 {
+		_, err := s.metrics.UpdateByID(ctx, key, bson.M{
+			"$inc": bson.M{"totalSent": 1},
+			"$set": bson.M{"lastSentAt": now, "tenant": tenant, "namespace": namespace},
+			"$min": bson.M{"firstSentAt": now},
+		}, options.UpdateOne().SetUpsert(true))
+		return err
+	}
+	set := bson.M{
+		"tenant":      tenant,
+		"namespace":   namespace,
+		"totalSent":   bson.M{"$add": bson.A{bson.M{"$ifNull": bson.A{"$totalSent", 0}}, 1}},
+		"lastSentAt":  now,
+		"firstSentAt": bson.M{"$min": bson.A{"$firstSentAt", now}},
+	}
+	if s.ttl >= time.Hour {
+		sent1h := int64(ent.CountSentInWindow(now, time.Hour))
+		set["peak1h"] = bson.M{"$max": bson.A{bson.M{"$ifNull": bson.A{"$peak1h", 0}}, sent1h}}
+		set["peak1hAt"] = bson.M{"$cond": bson.A{
+			bson.M{"$gt": bson.A{sent1h, bson.M{"$ifNull": bson.A{"$peak1h", 0}}}},
+			now, "$peak1hAt",
+		}}
+	}
+	if s.ttl >= 24*time.Hour {
+		sent24h := int64(ent.CountSentInWindow(now, 24*time.Hour))
+		set["peak24h"] = bson.M{"$max": bson.A{bson.M{"$ifNull": bson.A{"$peak24h", 0}}, sent24h}}
+		set["peak24hAt"] = bson.M{"$cond": bson.A{
+			bson.M{"$gt": bson.A{sent24h, bson.M{"$ifNull": bson.A{"$peak24h", 0}}}},
+			now, "$peak24hAt",
+		}}
+	}
+	_, err := s.metrics.UpdateByID(ctx, key, mongo.Pipeline{{{Key: "$set", Value: set}}}, options.UpdateOne().SetUpsert(true))
+	return err
+}
+
+// bumpDeferredMetrics is the metrics-doc update for a Deferred CheckAndReserve.
+// Mirrors RecordAsDeferred's bump.
+func (s *Store) bumpDeferredMetrics(ctx context.Context, key, tenant, namespace string) error {
+	now := time.Now()
+	_, err := s.metrics.UpdateByID(ctx, key, bson.M{
 		"$inc": bson.M{"totalDeferred": 1},
 		"$set": bson.M{"lastDeferredAt": now, "tenant": tenant, "namespace": namespace},
 		"$min": bson.M{"firstDeferredAt": now},

@@ -9,8 +9,6 @@ sequenceDiagram
     actor Client
     participant Protector
     participant Store
-    participant Debounce as "debounce : Coalescer"
-    participant Quota as "quota : Coalescer"
 
     Client->>+Protector: NewWrite("store", "Debounce 1/30ms", "Quota 2/24h")
     Protector-->>-Client: "core.WriteGate"
@@ -18,10 +16,6 @@ sequenceDiagram
     Client->>+Protector: Check()
     Protector->>+Store: ReadEntry("act-1:contact-1")
     Store-->>-Protector: "entry", nil
-    Protector->>+Debounce: ShouldDefer()
-    Debounce-->>-Protector: false
-    Protector->>+Quota: ShouldDefer()
-    Quota-->>-Protector: false
     Protector-->>-Client: "Proceed"
     Note over Client: → Proceed
     Note over Client: send to downstream succeeded → RecordAsSent
@@ -54,14 +48,11 @@ sequenceDiagram
     actor Client
     participant Protector
     participant Store
-    participant Debounce as "debounce : Coalescer"
 
     Note over Client: Check(content=hash-B, target=act-1:contact-1) — 1 send within debounce window
     Client->>+Protector: Check()
     Protector->>+Store: ReadEntry("act-1:contact-1")
     Store-->>-Protector: "entry", nil
-    Protector->>+Debounce: ShouldDefer()
-    Debounce-->>-Protector: true
     Protector->>+Store: RecordAsDeferred("act-1:contact-1", "<10 bytes>")
     Store-->>-Protector: nil
     Protector-->>-Client: "Deferred (leading-edge debounce 30ms)"
@@ -75,17 +66,11 @@ sequenceDiagram
     actor Client
     participant Protector
     participant Store
-    participant Debounce as "debounce : Coalescer"
-    participant Quota as "quota : Coalescer"
 
     Note over Client: Check(content=hash-C, target=act-1:contact-3) — quota at hardCap=2, debounce window expired
     Client->>+Protector: Check()
     Protector->>+Store: ReadEntry("act-1:contact-3")
     Store-->>-Protector: "entry", nil
-    Protector->>+Debounce: ShouldDefer()
-    Debounce-->>-Protector: false
-    Protector->>+Quota: ShouldDefer()
-    Quota-->>-Protector: true
     Protector->>+Store: RecordAsDeferred("act-1:contact-3", "<10 bytes>")
     Store-->>-Protector: nil
     Protector-->>-Client: "Deferred (quota cap 2 per 24h)"
@@ -99,17 +84,11 @@ sequenceDiagram
     actor Client
     participant Protector
     participant Store
-    participant Debounce as "debounce : Coalescer"
-    participant Quota as "quota : Coalescer"
 
     Note over Client: Check(content=hash-D, target=act-1:contact-4) — counts start at 0
     Client->>+Protector: Check()
     Protector->>+Store: ReadEntry("act-1:contact-4")
     Store-->>-Protector: "entry", nil
-    Protector->>+Debounce: ShouldDefer()
-    Debounce-->>-Protector: false
-    Protector->>+Quota: ShouldDefer()
-    Quota-->>-Protector: false
     Protector-->>-Client: "Proceed"
     Note over Client: → Proceed
     Client->>+Protector: RecordAsSent()
@@ -125,23 +104,13 @@ sequenceDiagram
     actor Client
     participant Protector
     participant Store
-    participant Debounce as "debounce : Coalescer"
-    participant Quota as "quota : Coalescer"
 
     Note over Client: ReplayCandidates(limit=10) — replay sweep
     Client->>+Protector: ReplayCandidates(10)
     Protector->>+Store: RangeDeferred(10)
     Note over Protector: examine act-1:contact-1
-    Protector->>+Debounce: ShouldDefer()
-    Debounce-->>-Protector: false
-    Protector->>+Quota: ShouldDefer()
-    Quota-->>-Protector: false
     Note over Protector: caps clear → replay candidate
     Note over Protector: examine act-1:contact-3
-    Protector->>+Debounce: ShouldDefer()
-    Debounce-->>-Protector: false
-    Protector->>+Quota: ShouldDefer()
-    Quota-->>-Protector: true
     Note over Protector: caps not clear → skip
     Store-->>-Protector: nil
     Protector-->>-Client: "1 DeferredRequest"

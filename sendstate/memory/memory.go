@@ -7,6 +7,7 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -331,6 +332,294 @@ func (m *Store) RecordAsDeferred(_ context.Context, key, tenant, namespace strin
 
 	m.maybeSweep()
 	return nil
+}
+
+// CheckAndReserve atomically (within this process) evaluates the dedupe
+// layer + every req.DeferEvals against the key's TTL-honored entry and
+// either reserves a send-slot (push) or stamps a deferred breadcrumb,
+// matching the [sendstate.Store.CheckAndReserve] contract. Implementation
+// is a CAS loop on the entry record: one fresh ReadEntry-equivalent
+// (TTL-filtering inside the loop) per iteration drives all policy
+// evaluation; the swap commits the outcome.
+//
+// Cross-process correctness is best-effort, like every other write on
+// this backend — concurrent processes each have their own Store, so the
+// cap holds only within one process. Use [pith/sendstate/mongodb] for
+// multi-instance coordination.
+func (m *Store) CheckAndReserve(_ context.Context, req sendstate.ReserveRequest, messageRef []byte) (sendstate.ReserveResult, error) {
+	if len(req.Coalescers) == 0 {
+		return sendstate.ReserveResult{}, errors.New("memory: CheckAndReserve requires at least one Coalescer")
+	}
+
+	now := time.Now()
+	expireAt := now.Add(m.ttl)
+
+	// Peak-fold inputs are captured below on a successful Proceed CAS and
+	// then folded by the metrics-CAS step. Same conditions as RecordAsSent
+	// (cap above the dedupe floor; TTL covers the window).
+	fold1h := m.maxSendTimes() > 1 && m.ttl >= time.Hour
+	fold24h := m.maxSendTimes() > 1 && m.ttl >= 24*time.Hour
+	trackPeaks := fold1h || fold24h
+	var sent1h, sent24h int
+
+	var result sendstate.ReserveResult
+
+	// Entry CAS — policy evaluation + reserve / breadcrumb-stamp commit.
+	for {
+		v, loaded := m.entries.Load(req.Key)
+
+		// prev tracks the record currently in the map (the CAS witness);
+		// entry is the policy-input view, zeroed when prev is TTL-expired
+		// so dedupe / Coalescers see "nothing recorded yet."
+		var prev *entryRecord
+		var entry sendstate.Entry
+		if loaded {
+			prev = v.(*entryRecord)
+			if prev.expireAt.After(now) {
+				entry = prev.entry
+			}
+		}
+
+		// Layer 1: content dedupe (write side only — ContentHash != "").
+		// Deduped is a drop, not a write — nothing to swap, return now.
+		if req.ContentHash != "" && entry.Seen(req.ContentHash) {
+			return sendstate.ReserveResult{Deduped: true, Reason: "duplicate content"}, nil
+		}
+
+		// Layer 2: Coalescers in attached order; first defer wins.
+		var deferReason string
+		for _, c := range req.Coalescers {
+			if c.ShouldDefer(entry, now) {
+				deferReason = c.Name()
+				break
+			}
+		}
+
+		if deferReason != "" {
+			// Deferred: stamp the breadcrumb on the entry (mirrors
+			// RecordAsDeferred — append to LastNDeferredTimes, set
+			// LastDeferredMessageRef, refresh TTL).
+			dtimes := append(append([]time.Time(nil), entry.LastNDeferredTimes...), now)
+			if n := m.maxSendTimes(); len(dtimes) > n {
+				dtimes = append([]time.Time(nil), dtimes[len(dtimes)-n:]...)
+			}
+			next := &entryRecord{
+				entry: sendstate.Entry{
+					ContentHash:            entry.ContentHash,
+					LastDeferredMessageRef: messageRef,
+					LastNSendTimes:         entry.LastNSendTimes,
+					LastNDeferredTimes:     dtimes,
+				},
+				expireAt:  expireAt,
+				tenant:    req.Tenant,
+				namespace: req.Namespace,
+			}
+			if prev == nil {
+				if _, lost := m.entries.LoadOrStore(req.Key, next); !lost {
+					result.Deferred = true
+					result.Reason = deferReason
+					break
+				}
+				continue
+			}
+			if m.entries.CompareAndSwap(req.Key, prev, next) {
+				result.Deferred = true
+				result.Reason = deferReason
+				break
+			}
+			continue
+		}
+
+		// Proceed: reserve a send-slot. The ContentHash IS updated here
+		// (the reserve is the optimistic record); a subsequent ReleaseReservation
+		// pops the timestamp by value but does not roll back ContentHash —
+		// see the sendstate package doc for the trade-off.
+		stimes := append(append([]time.Time(nil), entry.LastNSendTimes...), now)
+		if n := m.maxSendTimes(); len(stimes) > n {
+			stimes = append([]time.Time(nil), stimes[len(stimes)-n:]...)
+		}
+		next := &entryRecord{
+			entry: sendstate.Entry{
+				ContentHash:            req.ContentHash, // empty on read gates — preserved as empty
+				LastDeferredMessageRef: entry.LastDeferredMessageRef,
+				LastNSendTimes:         stimes,
+				LastNDeferredTimes:     entry.LastNDeferredTimes,
+			},
+			expireAt:  expireAt,
+			tenant:    req.Tenant,
+			namespace: req.Namespace,
+		}
+		if prev == nil {
+			if _, lost := m.entries.LoadOrStore(req.Key, next); !lost {
+				if trackPeaks {
+					e := sendstate.Entry{LastNSendTimes: stimes}
+					sent1h = e.CountSentInWindow(now, time.Hour)
+					sent24h = e.CountSentInWindow(now, 24*time.Hour)
+				}
+				result.ReservedAt = now
+				break
+			}
+			continue
+		}
+		if m.entries.CompareAndSwap(req.Key, prev, next) {
+			if trackPeaks {
+				e := sendstate.Entry{LastNSendTimes: stimes}
+				sent1h = e.CountSentInWindow(now, time.Hour)
+				sent24h = e.CountSentInWindow(now, 24*time.Hour)
+			}
+			result.ReservedAt = now
+			break
+		}
+	}
+
+	// Metrics CAS — bump lifetime counters according to the outcome. Same
+	// semantic split as RecordAsSent / RecordAsDeferred; we inline both
+	// branches rather than calling those methods to avoid stamping a
+	// second "now" or double-pushing.
+	if result.Deferred {
+		m.bumpDeferredMetrics(req.Key, req.Tenant, req.Namespace, now)
+	} else {
+		m.bumpSentMetrics(req.Key, req.Tenant, req.Namespace, now, fold1h, fold24h, sent1h, sent24h)
+	}
+
+	m.maybeSweep()
+	return result, nil
+}
+
+// ReleaseReservation pops the send-timestamp at reservedAt from the key's
+// LastNSendTimes — by value, so concurrent sibling reserves on the same
+// key keep their slots. Lifetime metrics (TotalSent, peaks, LastSentAt)
+// are *not* rolled back: the count tracks reserve attempts, and the peaks
+// captured "level reached." See sendstate package doc for the trade-off.
+//
+// Best-effort — a missing record (TTL'd or never created) or a missing
+// timestamp (already swept by maxSendTimes overflow) is a silent no-op.
+func (m *Store) ReleaseReservation(_ context.Context, key string, reservedAt time.Time) error {
+	for {
+		v, ok := m.entries.Load(key)
+		if !ok {
+			return nil // gone — slot already absent
+		}
+		prev := v.(*entryRecord)
+
+		// Find the most-recent occurrence of reservedAt. Walk from the tail
+		// (newest first) because a freshly-failed reserve is overwhelmingly
+		// near the tail.
+		idx := -1
+		for i := len(prev.entry.LastNSendTimes) - 1; i >= 0; i-- {
+			if prev.entry.LastNSendTimes[i].Equal(reservedAt) {
+				idx = i
+				break
+			}
+		}
+		if idx == -1 {
+			return nil // not present — overflow popped it or a sibling beat us
+		}
+
+		stimes := make([]time.Time, 0, len(prev.entry.LastNSendTimes)-1)
+		stimes = append(stimes, prev.entry.LastNSendTimes[:idx]...)
+		stimes = append(stimes, prev.entry.LastNSendTimes[idx+1:]...)
+
+		next := &entryRecord{
+			entry: sendstate.Entry{
+				ContentHash:            prev.entry.ContentHash,
+				LastDeferredMessageRef: prev.entry.LastDeferredMessageRef,
+				LastNSendTimes:         stimes,
+				LastNDeferredTimes:     prev.entry.LastNDeferredTimes,
+			},
+			expireAt:  prev.expireAt,
+			tenant:    prev.tenant,
+			namespace: prev.namespace,
+		}
+		if m.entries.CompareAndSwap(key, prev, next) {
+			return nil
+		}
+		// CAS conflict — concurrent write to this key; retry.
+	}
+}
+
+// bumpSentMetrics is the metrics-CAS portion of RecordAsSent + CheckAndReserve's
+// Proceed branch. Factored so both call sites stamp identical lifetime
+// updates from the same now and pre-counted peak inputs.
+func (m *Store) bumpSentMetrics(key, tenant, namespace string, now time.Time, fold1h, fold24h bool, sent1h, sent24h int) {
+	for {
+		v, loaded := m.metrics.Load(key)
+		if !loaded {
+			fresh := &sendstate.Metrics{
+				Tenant:      tenant,
+				Namespace:   namespace,
+				TotalSent:   1,
+				FirstSentAt: now,
+				LastSentAt:  now,
+			}
+			if fold1h {
+				fresh.Peak1h, fresh.Peak1hAt = uint64(sent1h), now
+			}
+			if fold24h {
+				fresh.Peak24h, fresh.Peak24hAt = uint64(sent24h), now
+			}
+			if _, lost := m.metrics.LoadOrStore(key, fresh); !lost {
+				return
+			}
+			continue
+		}
+		prev := v.(*sendstate.Metrics)
+		next := *prev
+		next.Tenant = tenant
+		next.Namespace = namespace
+		next.TotalSent = prev.TotalSent + 1
+		next.LastSentAt = now
+		if next.FirstSentAt.IsZero() {
+			next.FirstSentAt = now
+		}
+		if fold1h {
+			if c := uint64(sent1h); c > next.Peak1h {
+				next.Peak1h, next.Peak1hAt = c, now
+			}
+		}
+		if fold24h {
+			if c := uint64(sent24h); c > next.Peak24h {
+				next.Peak24h, next.Peak24hAt = c, now
+			}
+		}
+		if m.metrics.CompareAndSwap(key, prev, &next) {
+			return
+		}
+	}
+}
+
+// bumpDeferredMetrics is the metrics-CAS portion of RecordAsDeferred + the
+// Deferred branch of CheckAndReserve. Same factoring rationale as
+// bumpSentMetrics.
+func (m *Store) bumpDeferredMetrics(key, tenant, namespace string, now time.Time) {
+	for {
+		v, loaded := m.metrics.Load(key)
+		if !loaded {
+			fresh := &sendstate.Metrics{
+				Tenant:          tenant,
+				Namespace:       namespace,
+				TotalDeferred:   1,
+				FirstDeferredAt: now,
+				LastDeferredAt:  now,
+			}
+			if _, lost := m.metrics.LoadOrStore(key, fresh); !lost {
+				return
+			}
+			continue
+		}
+		prev := v.(*sendstate.Metrics)
+		next := *prev
+		next.Tenant = tenant
+		next.Namespace = namespace
+		next.TotalDeferred = prev.TotalDeferred + 1
+		next.LastDeferredAt = now
+		if next.FirstDeferredAt.IsZero() {
+			next.FirstDeferredAt = now
+		}
+		if m.metrics.CompareAndSwap(key, prev, &next) {
+			return
+		}
+	}
 }
 
 // ReadEntry returns the key's [sendstate.Entry], honoring the TTL: a

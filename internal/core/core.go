@@ -110,6 +110,14 @@ func (r ReadNamespaceGate) ReplayCandidates(ctx context.Context, limit int) ([]p
 	return r.replay(ctx, limit)
 }
 
+// CheckAndReserve is the atomic cap-discipline counterpart to Check +
+// RecordAsSent. See [protect.ReadNamespace.CheckAndReserve] for the
+// contract — two outcomes (Proceed / Deferred), fail-closed on store
+// error, ReleaseFunc rolls back a Proceed reservation on op failure.
+func (r ReadNamespaceGate) CheckAndReserve(ctx context.Context, meta protect.RequestMeta) (protect.Outcome, protect.ReleaseFunc) {
+	return r.checkAndReserve(ctx, meta, "")
+}
+
 // WriteGate is the root write-side protector: content dedupe + coalescers. It
 // is a factory whose only method is [WriteGate.Tenant], which mints a
 // [WriteTenantGate]; that handle in turn mints the namespace-scoped
@@ -165,6 +173,15 @@ func (w WriteNamespaceGate) ReplayCandidates(ctx context.Context, limit int) ([]
 	return w.replay(ctx, limit)
 }
 
+// CheckAndReserve is the atomic cap-discipline counterpart to Check +
+// RecordAsSent. See [protect.WriteNamespace.CheckAndReserve] for the
+// contract — three outcomes (Proceed / Deduped / Deferred), fail-closed
+// on store error, ReleaseFunc rolls back a Proceed reservation on op
+// failure.
+func (w WriteNamespaceGate) CheckAndReserve(ctx context.Context, meta protect.RequestMeta, contentHash string) (protect.Outcome, protect.ReleaseFunc) {
+	return w.checkAndReserve(ctx, meta, contentHash)
+}
+
 // NewRead builds a root read gate over store with the given Coalescers (at
 // least one is required; see [newGate]). Internal — called by the factory
 // subpackages. The returned gate is the root of the Tenant → Namespace
@@ -189,8 +206,8 @@ func NewWrite(store sendstate.Store, coalescers ...coalesce.Coalescer) WriteGate
 func LargestHardCap(coalescers ...coalesce.Coalescer) int {
 	largest := 0
 	for _, c := range coalescers {
-		if _, hardCap, _ := c.CapPolicy(); hardCap > largest {
-			largest = hardCap
+		if c.HardCap > largest {
+			largest = c.HardCap
 		}
 	}
 	return largest
@@ -207,7 +224,7 @@ func LargestHardCap(coalescers ...coalesce.Coalescer) int {
 //   - a self-sizing store (one exposing GrowMaxSendTimes) is grown to the
 //     largest hardCap so the send-timestamp list can't undercount.
 //
-// Coalescer names (from [coalesce.Coalescer.CapPolicy]) must be unique —
+// Coalescer names (from [coalesce.Coalescer.Name]) must be unique —
 // Check surfaces the name in Outcome.Reason, so two caps sharing a name
 // would be ambiguous (panic on collision).
 func newGate(store sendstate.Store, dedupe bool, coalescers []coalesce.Coalescer) *gate {
@@ -222,16 +239,16 @@ func newGate(store sendstate.Store, dedupe bool, coalescers []coalesce.Coalescer
 	var maxWindow time.Duration
 	seen := make(map[string]struct{}, len(coalescers))
 	for _, c := range coalescers {
-		name, hardCap, window := c.CapPolicy()
+		name := c.Name()
 		if _, dup := seen[name]; dup {
 			panic(fmt.Sprintf("protect: duplicate Coalescer name %q — attached caps must be unique", name))
 		}
 		seen[name] = struct{}{}
-		if hardCap > maxCap {
-			maxCap = hardCap
+		if c.HardCap > maxCap {
+			maxCap = c.HardCap
 		}
-		if window > maxWindow {
-			maxWindow = window
+		if c.Window > maxWindow {
+			maxWindow = c.Window
 		}
 	}
 
@@ -281,9 +298,8 @@ func (g *scopedGate) check(ctx context.Context, meta protect.RequestMeta, conten
 	// and observability can group by tenant.
 	for _, c := range g.coalescers {
 		if c.ShouldDefer(entry, now) {
-			capName, _, _ := c.CapPolicy()
 			recErr := g.store.RecordAsDeferred(ctx, meta.TargetKey, g.tenant, g.namespace, meta.MessageRef)
-			return protect.Outcome{Decision: protect.DecisionDeferred, Reason: capName, Err: recErr}
+			return protect.Outcome{Decision: protect.DecisionDeferred, Reason: c.Name(), Err: recErr}
 		}
 	}
 
@@ -342,4 +358,59 @@ func (g *gate) capsClear(e sendstate.Entry, now time.Time) bool {
 		}
 	}
 	return true
+}
+
+// checkAndReserve drives the atomic Store.CheckAndReserve primitive
+// through the gate's coalescer set. The path:
+//
+//  1. Build a [sendstate.ReserveRequest] from this handle's
+//     tenant / namespace + the caller's meta + contentHash + the
+//     gate's [coalesce.Coalescer] slice (the store switches on each
+//     Coalescer's Strategy internally — Go-side for the in-process
+//     backend, Mongo aggregation for the Atlas backend).
+//  2. Call [sendstate.Store.CheckAndReserve], translate the
+//     [sendstate.ReserveResult] into a [protect.Outcome], and on a
+//     Proceed return a [protect.ReleaseFunc] that closes over the
+//     reserved timestamp.
+//
+// Fail-policy: a store error returns DecisionDeferred + non-nil
+// Outcome.Err (fail-closed — replay sweep re-drives). Distinct from
+// [scopedGate.check], which fails open. The polarity matters because
+// the reserve path exists to enforce a cap; failing open here would let
+// a store outage breach the very cap CheckAndReserve closes the TOCTOU on.
+//
+// Read gates pass an empty contentHash — the store's dedupe layer is
+// then wired off and Deduped is unreachable.
+func (g *scopedGate) checkAndReserve(ctx context.Context, meta protect.RequestMeta, contentHash string) (protect.Outcome, protect.ReleaseFunc) {
+	req := sendstate.ReserveRequest{
+		Key:         meta.TargetKey,
+		Tenant:      g.tenant,
+		Namespace:   g.namespace,
+		ContentHash: contentHash,
+		Coalescers:  g.coalescers,
+	}
+	res, err := g.store.CheckAndReserve(ctx, req, meta.MessageRef)
+	if err != nil {
+		// Fail-closed: even if the store erred mid-pipeline, surface
+		// Deferred so the replay sweep re-drives the request.
+		reason := res.Reason
+		if reason == "" {
+			reason = "store error"
+		}
+		return protect.Outcome{Decision: protect.DecisionDeferred, Reason: reason, Err: err}, nil
+	}
+	switch {
+	case res.Deduped:
+		return protect.Outcome{Decision: protect.DecisionDeduped, Reason: res.Reason}, nil
+	case res.Deferred:
+		return protect.Outcome{Decision: protect.DecisionDeferred, Reason: res.Reason}, nil
+	}
+	// Proceed: capture the reservedAt for the release closure. The store
+	// reference is captured too — same lifetime as the gate.
+	store := g.store
+	key := meta.TargetKey
+	reservedAt := res.ReservedAt
+	return protect.Outcome{Decision: protect.DecisionProceed}, func(ctx context.Context) error {
+		return store.ReleaseReservation(ctx, key, reservedAt)
+	}
 }

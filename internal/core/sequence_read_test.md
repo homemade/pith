@@ -9,7 +9,6 @@ sequenceDiagram
     actor Client
     participant Protector
     participant Store
-    participant Debounce as "debounce : Coalescer"
 
     Client->>+Protector: NewRead("store", "Trailing 100ms")
     Protector-->>-Client: "core.ReadGate"
@@ -17,8 +16,6 @@ sequenceDiagram
     Client->>+Protector: Check()
     Protector->>+Store: ReadEntry("campaign-1:webhooks:profile-1")
     Store-->>-Protector: "entry", nil
-    Protector->>+Debounce: ShouldDefer()
-    Debounce-->>-Protector: false
     Protector-->>-Client: "Proceed"
     Note over Client: → Proceed
     Note over Client: read current state succeeded → RecordAsSent
@@ -35,14 +32,11 @@ sequenceDiagram
     actor Client
     participant Protector
     participant Store
-    participant Debounce as "debounce : Coalescer"
 
     Note over Client: Check(target=campaign-1:webhooks:profile-1) — burst: a send is within the window
     Client->>+Protector: Check()
     Protector->>+Store: ReadEntry("campaign-1:webhooks:profile-1")
     Store-->>-Protector: "entry", nil
-    Protector->>+Debounce: ShouldDefer()
-    Debounce-->>-Protector: true
     Protector->>+Store: RecordAsDeferred("campaign-1:webhooks:profile-1", "<12 bytes>")
     Store-->>-Protector: nil
     Protector-->>-Client: "Deferred (trailing-edge debounce 100ms)"
@@ -56,14 +50,11 @@ sequenceDiagram
     actor Client
     participant Protector
     participant Store
-    participant Debounce as "debounce : Coalescer"
 
     Note over Client: ReplayCandidates(limit=10) — burst still active
     Client->>+Protector: ReplayCandidates(10)
     Protector->>+Store: RangeDeferred(10)
     Note over Protector: examine campaign-1:webhooks:profile-1
-    Protector->>+Debounce: ShouldDefer()
-    Debounce-->>-Protector: true
     Note over Protector: caps not clear → skip
     Store-->>-Protector: nil
     Protector-->>-Client: "0 DeferredRequest"
@@ -77,14 +68,11 @@ sequenceDiagram
     actor Client
     participant Protector
     participant Store
-    participant Debounce as "debounce : Coalescer"
 
     Note over Client: ReplayCandidates(limit=10) — window cleared (gone quiet)
     Client->>+Protector: ReplayCandidates(10)
     Protector->>+Store: RangeDeferred(10)
     Note over Protector: examine campaign-1:webhooks:profile-1
-    Protector->>+Debounce: ShouldDefer()
-    Debounce-->>-Protector: false
     Note over Protector: caps clear → replay candidate
     Store-->>-Protector: nil
     Protector-->>-Client: "1 DeferredRequest"

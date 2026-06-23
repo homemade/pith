@@ -72,17 +72,15 @@ func TestReadGateScenarios(t *testing.T) {
 	const debounceWindow = 100 * time.Millisecond
 	const entryTTL = 24 * time.Hour
 
-	// Track the collaborator interfaces so a method added to either fails
-	// this test until a scenario exercises it (or it's allowlisted in
-	// AssertCovered below). The facade ReadGate is deliberately not tracked —
-	// the diagram documents a chosen subset of its surface.
+	// Track the Store interface so a method added to it fails this test
+	// until a scenario exercises it (or it's allowlisted in AssertCovered
+	// below). The Coalescer type used to be an interface — under the
+	// data-only redesign (Strategy enum + struct + Store-side eval) the
+	// Coalescer's methods (Name / ShouldDefer) are no longer called via
+	// an interface boundary that can be wrapped, so per-cap arrows are
+	// not recorded into the diagram. The facade ReadGate is deliberately
+	// not tracked — the diagram documents a chosen subset of its surface.
 	rec.Track("Store", reflect.TypeOf((*sendstate.Store)(nil)).Elem())
-	rec.Track("Debounce", reflect.TypeOf((*coalesce.Coalescer)(nil)).Elem())
-
-	// The cap is a coalesce.Coalescer instance, not a distinct type — label
-	// the lifeline UML role:type form so the diagram doesn't imply a type the
-	// package lacks. Arrows and coverage still key on "Debounce".
-	rec.Describe("Debounce", "debounce : Coalescer")
 
 	innerStore := memory.New(entryTTL)
 	recStore := &recordingSendStore{inner: innerStore, rec: rec}
@@ -108,7 +106,7 @@ func TestReadGateScenarios(t *testing.T) {
 	// is replayable.
 	p := core.NewRead(
 		recStore,
-		&recordingCap{inner: innerDebounce, rec: rec, name: "Debounce"},
+		innerDebounce,
 	)
 	rec.Exit([]any{"core.ReadGate"})
 	pr := &recordingReadProtector{inner: p.Tenant("").Namespace(""), rec: rec}
@@ -189,17 +187,18 @@ func TestReadGateScenarios(t *testing.T) {
 
 	t.Cleanup(func() {
 		rec.WriteMermaid(t)
-		// CapPolicy is infrastructure NewRead() uses to size the store — not
-		// part of the per-Check story. ReadMetrics is not reachable through
-		// any gate surface and no scenario reads it here.
+		// ReadMetrics is not reachable through any gate surface and no
+		// scenario reads it here.
 		rec.AssertCovered(t,
-			"Debounce.CapPolicy",
 			"Store.ReadMetrics",
+			// CheckAndReserve / ReleaseReservation are the atomic
+			// reserve-before-call path (plan 023 phase 1). The protect-layer
+			// gate method that exercises them lands in a separate scenario
+			// (TestReadGateCheckAndReserveScenarios) — allowlisted here so
+			// the legacy Check scenario set stays focused on the legacy
+			// Check/RecordAsSent flow.
+			"Store.CheckAndReserve",
+			"Store.ReleaseReservation",
 		)
-		// Explicit guard: the cap policy must stay observable as its own
-		// lifeline, evaluating an Entry via ShouldDefer.
-		if !rec.Recorded("Debounce", "ShouldDefer") {
-			t.Errorf("diagram must show Debounce.ShouldDefer — the cap is no longer observable")
-		}
 	})
 }

@@ -85,6 +85,8 @@ package sendstate
 import (
 	"context"
 	"time"
+
+	"github.com/homemade/pith/coalesce"
 )
 
 // Entry is the per-key working state read by policies. It carries the
@@ -305,13 +307,83 @@ type Metrics struct {
 	Peak24hAt time.Time
 }
 
+// MongoExpr is a Mongo aggregation expression: a tree of $-prefixed
+// operator nodes shaped as map[string]any, used by the Mongo backend's
+// `findOneAndUpdate` aggregation pipeline. Kept as a plain-map distinct
+// type so this package stays free of a `go.mongodb.org/mongo-driver`
+// dependency; the backend converts via `bson.M(expr)` at use-site.
+type MongoExpr map[string]any
+
+// ReserveRequest carries the addressing + policy inputs for
+// [Store.CheckAndReserve]: the target slot, the optional content hash for
+// dedupe (empty on read gates), and the ordered list of [pith/coalesce.Coalescer]s
+// to apply. Backends evaluate the coalescers themselves — Go-side via
+// [pith/coalesce.Coalescer.ShouldDefer], Mongo-side by switching on
+// [pith/coalesce.Coalescer.Strategy] internally.
+type ReserveRequest struct {
+	// Key is the per-key TargetKey the policies key off.
+	Key string
+
+	// Tenant is the optional outer scoping token stamped on the entry +
+	// Metrics doc; "" = untenanted.
+	Tenant string
+
+	// Namespace is the sweep-scoping token stamped on the entry +
+	// Metrics doc; "" = the whole store.
+	Namespace string
+
+	// ContentHash enables the dedupe layer when non-empty: the store
+	// compares it to the most recent send's hash and returns a
+	// [ReserveResult.Deduped] outcome on a match. Empty on read gates
+	// (which have no payload to fingerprint).
+	ContentHash string
+
+	// Coalescers are evaluated in attached order; the first to defer
+	// wins and its [coalesce.Coalescer.Name] is reported as
+	// [ReserveResult.Reason]. Must be non-empty.
+	Coalescers []coalesce.Coalescer
+}
+
+// ReserveResult is the outcome of an atomic [Store.CheckAndReserve]. On a
+// Proceed (neither Deduped nor Deferred), ReservedAt carries the
+// send-timestamp that was atomically pushed onto LastNSendTimes — pass it
+// back to [Store.ReleaseReservation] on op failure to pop that exact slot
+// by value (not position, so concurrent sibling reserves aren't
+// clobbered).
+type ReserveResult struct {
+	// Deduped is true iff the dedupe layer fired (ContentHash matched
+	// the most recent send's hash). Write gates only; a read-side
+	// CheckAndReserve passes an empty ContentHash so this is always
+	// false there.
+	Deduped bool
+
+	// Deferred is true iff a [DeferEvaluator] fired. Reason carries the
+	// firing evaluator's Name.
+	Deferred bool
+
+	// Reason is empty on a Proceed, "duplicate content" on a Deduped,
+	// and the firing evaluator's Name on a Deferred.
+	Reason string
+
+	// ReservedAt is the wall-time timestamp the store atomically pushed
+	// onto the entry's LastNSendTimes when neither Deduped nor Deferred
+	// fired. Pass it back to [Store.ReleaseReservation] on op failure.
+	// Zero on Deduped / Deferred.
+	ReservedAt time.Time
+}
+
 // Store is the shared per-key send-state store. [Store.ReadEntry]
 // drives the policies ([Entry.Seen], [pith/coalesce.Coalescer.ShouldDefer]);
 // [Store.ReadMetrics] serves observability. Writes come from
 // [pith/protect.WriteNamespace.RecordAsSent] /
-// [pith/protect.ReadNamespace.RecordAsSent] (on successful sends) and
+// [pith/protect.ReadNamespace.RecordAsSent] (on successful sends),
 // [pith/protect.WriteNamespace.Check] / [pith/protect.ReadNamespace.Check]
-// (on Coalescer-driven deferrals).
+// (on Coalescer-driven deferrals), and the atomic
+// [Store.CheckAndReserve] primitive that closes the TOCTOU window
+// between today's read-only Check and its follow-up RecordAsSent (the
+// reserve-before-call path used by the protect-layer
+// [pith/protect.WriteNamespace.CheckAndReserve] /
+// [pith/protect.ReadNamespace.CheckAndReserve]).
 type Store interface {
 	// RecordAsSent stores (key → contentHash) stamped at now, appends
 	// a timestamp to the key's LastNSendTimes, refreshes the Entry
@@ -388,4 +460,62 @@ type Store interface {
 	// (recency then makes the key no longer pending). pith provides no
 	// orchestration beyond this enumeration.
 	RangeDeferred(ctx context.Context, limit int, namespace string, fn func(key string, e Entry) bool) error
+
+	// CheckAndReserve atomically evaluates the dedupe layer (when
+	// req.ContentHash is non-empty) and every req.DeferEvals against the
+	// key's current state, and on a Proceed pushes a fresh send-timestamp
+	// onto LastNSendTimes (the "reserve") within the same operation. It
+	// is the cap-discipline counterpart to the read-only [Store.ReadEntry]
+	// + Coalescer + follow-up [Store.RecordAsSent] flow, collapsing those
+	// three steps' TOCTOU window into one atomic decision.
+	//
+	// Outcomes (see [ReserveResult]):
+	//
+	//   - Proceed (neither Deduped nor Deferred): the timestamp was
+	//     pushed; the caller performs the gated op and either does
+	//     nothing on success (the reserve already recorded) or calls
+	//     [Store.ReleaseReservation] with ReservedAt on failure to pop
+	//     that exact slot.
+	//   - Deduped: ContentHash matched the most recent send's hash;
+	//     nothing pushed, nothing to release; caller drops the op.
+	//   - Deferred: one of the DeferEvals fired; nothing pushed; the
+	//     store also stamps the deferred breadcrumb (LastDeferredMessageRef,
+	//     LastNDeferredTimes, lastDeferredAt) so the replay sweep can pick
+	//     it up via [Store.RangeDeferred].
+	//
+	// Fail-policy: a backing-store error returns Deferred + non-nil err
+	// (fail-closed — the replay sweep re-drives), unlike [Store.ReadEntry]
+	// which fails open. The polarity matters because CheckAndReserve is on
+	// the proactive cap-enforcement path: failing open here would let a
+	// store outage breach the very cap CheckAndReserve exists to enforce.
+	//
+	// req.DeferEvals must be non-empty. The first evaluator that defers
+	// wins and its Name is reported in Reason. For the Mongo backend,
+	// every DeferEvaluator must return a non-nil MongoExpression — the
+	// [pith/protect/mongodb] factory validates this at construction so a
+	// well-built protector never violates it here.
+	//
+	// req.MessageRef carries the replay breadcrumb stamped on a Deferred
+	// outcome, exactly as [Store.RecordAsDeferred] would stamp it. (It is
+	// part of the addressing input; tenant + namespace are stamped on
+	// every write, send or deferred.)
+	CheckAndReserve(ctx context.Context, req ReserveRequest, messageRef []byte) (ReserveResult, error)
+
+	// ReleaseReservation pops the send-timestamp at reservedAt from the
+	// key's LastNSendTimes (and rolls back the matching peak / lifetime
+	// updates atomically with the pop, so Metrics doesn't drift). Used on
+	// gated-op failure after a successful Proceed [Store.CheckAndReserve]
+	// to preserve the record-on-success accuracy of the legacy flow.
+	//
+	// Match is by value, not position — concurrent sibling reservations
+	// may have pushed their own timestamps onto the same key's list
+	// between this reserve and its release, and popping by position would
+	// clobber theirs. (Two reserves at the exact same nanosecond can both
+	// release — each pop removes one occurrence of the matching value;
+	// the second release is a no-op.)
+	//
+	// Best-effort: a backing-store error means the slot leaks until the
+	// trailing window slides it out (bounded by the largest attached
+	// Coalescer's window). Callers log and continue; never panic.
+	ReleaseReservation(ctx context.Context, key string, reservedAt time.Time) error
 }

@@ -65,25 +65,11 @@ func outcomeLabel(out protect.Outcome) string {
 	return out.Decision.String()
 }
 
-// recordingCap wraps a coalesce.Coalescer and tags its diagram
-// participant with a caller-supplied name (e.g. "Debounce",
-// "Quota") so each attached cap shows up as its own lifeline. Its
-// arrows originate from the Protector, which is what calls ShouldDefer.
-type recordingCap struct {
-	inner coalesce.Coalescer
-	rec   *sequencerec.Recorder
-	name  string
-}
-
-func (r *recordingCap) ShouldDefer(entry sendstate.Entry, now time.Time) bool {
-	d := r.inner.ShouldDefer(entry, now)
-	r.rec.RecordCall("Protector", r.name, "ShouldDefer", nil, []any{d})
-	return d
-}
-
-func (r *recordingCap) CapPolicy() (name string, hardCap int, window time.Duration) {
-	return r.inner.CapPolicy()
-}
+// (Under the data-only Coalescer design — Strategy enum + struct,
+// methods evaluated by the Store backends — there's no interface to
+// wrap, so per-cap ShouldDefer arrows can no longer be tagged into the
+// diagram via a wrapper. Coalescer values are passed through the gate
+// directly. Store-level interactions still record as before.)
 
 // recordingSendStore wraps a [sendstate.Store] so the read + write
 // surface the gate uses surfaces in the diagram as Protector->Store
@@ -148,6 +134,18 @@ func (r *recordingSendStore) RecordAsDeferred(ctx context.Context, key, tenant, 
 	return err
 }
 
+func (r *recordingSendStore) CheckAndReserve(ctx context.Context, req sendstate.ReserveRequest, messageRef []byte) (sendstate.ReserveResult, error) {
+	res, err := r.inner.CheckAndReserve(ctx, req, messageRef)
+	r.rec.RecordCall("Protector", "Store", "CheckAndReserve", []any{req.Key}, []any{fmt.Sprintf("deduped=%v deferred=%v reason=%q", res.Deduped, res.Deferred, res.Reason), err})
+	return res, err
+}
+
+func (r *recordingSendStore) ReleaseReservation(ctx context.Context, key string, reservedAt time.Time) error {
+	err := r.inner.ReleaseReservation(ctx, key, reservedAt)
+	r.rec.RecordCall("Protector", "Store", "ReleaseReservation", []any{key}, []any{err})
+	return err
+}
+
 // TestWriteGateScenarios exercises each [core.WriteGate] Check decision
 // branch and emits a Mermaid sequence diagram next to this file
 // (sequence_write_test.md).
@@ -163,20 +161,16 @@ func TestWriteGateScenarios(t *testing.T) {
 	const debounceWindow = 30 * time.Millisecond
 	const hardCap = 2
 
-	// Track the observed interfaces so a method added to either surface
-	// fails this test until a scenario exercises it (or it's allowlisted
-	// in AssertCovered below). The facade WriteGate is deliberately not
-	// tracked — the diagram documents a chosen subset of its surface.
+	// Track the Store interface so a method added to it fails this test
+	// until a scenario exercises it (or it's allowlisted in AssertCovered
+	// below). The Coalescer type used to be an interface (Debounce/Quota
+	// were tracked as wrapped instances of it) — under the data-only
+	// redesign (Strategy enum + struct + Store-side eval) the Coalescer's
+	// methods are no longer called via an interface boundary that can be
+	// wrapped, so per-cap arrows are not recorded into the diagram. The
+	// facade WriteGate is deliberately not tracked — the diagram documents
+	// a chosen subset of its surface.
 	rec.Track("Store", reflect.TypeOf((*sendstate.Store)(nil)).Elem())
-	rec.Track("Debounce", reflect.TypeOf((*coalesce.Coalescer)(nil)).Elem())
-	rec.Track("Quota", reflect.TypeOf((*coalesce.Coalescer)(nil)).Elem())
-
-	// Both caps are instances of the one coalesce.Coalescer type, not
-	// distinct types — label the lifelines UML role:type form so the
-	// diagram doesn't imply Debounce/Quota types the package lacks.
-	// Arrows and coverage still key on "Debounce" / "Quota".
-	rec.Describe("Debounce", "debounce : Coalescer")
-	rec.Describe("Quota", "quota : Coalescer")
 
 	innerStore := memory.New(capWindow)
 	recStore := &recordingSendStore{inner: innerStore, rec: rec}
@@ -211,8 +205,8 @@ func TestWriteGateScenarios(t *testing.T) {
 	// first (cheaper / source-driven check).
 	p := core.NewWrite(
 		recStore,
-		&recordingCap{inner: innerDebounce, rec: rec, name: "Debounce"},
-		&recordingCap{inner: innerQuota, rec: rec, name: "Quota"},
+		innerDebounce,
+		innerQuota,
 	)
 	rec.Exit([]any{"core.WriteGate"})
 	pr := &recordingProtector{inner: p.Tenant("").Namespace(""), rec: rec}
@@ -354,27 +348,20 @@ func TestWriteGateScenarios(t *testing.T) {
 
 	t.Cleanup(func() {
 		rec.WriteMermaid(t)
-		// CapPolicy is infrastructure NewWrite() uses to size the store —
-		// not part of the per-Check story this diagram tells. ReadMetrics
-		// is not reachable through any gate surface; scenario 1 reads it
-		// directly off the raw store as a test verification step, which
-		// intentionally bypasses the recording wrapper so it doesn't show
-		// up as a Protector→Store arrow in the diagram.
+		// ReadMetrics is not reachable through any gate surface; scenario
+		// 1 reads it directly off the raw store as a test verification
+		// step, which intentionally bypasses the recording wrapper so it
+		// doesn't show up as a Protector→Store arrow in the diagram.
 		rec.AssertCovered(t,
-			"Debounce.CapPolicy",
-			"Quota.CapPolicy",
 			"Store.ReadMetrics",
+			// CheckAndReserve / ReleaseReservation are the atomic
+			// reserve-before-call path (plan 023 phase 1). The protect-layer
+			// gate method that exercises them lands in a separate scenario
+			// (TestWriteGateCheckAndReserveScenarios) — allowlisted here so
+			// the legacy Check scenario set stays focused on the legacy
+			// Check/RecordAsSent flow.
+			"Store.CheckAndReserve",
+			"Store.ReleaseReservation",
 		)
-		// Explicit guard: both cap policies must stay observable as
-		// their own lifelines, evaluating an Entry via ShouldDefer.
-		// AssertCovered would also trip if these went dark, but only
-		// incidentally (the tracked names would record nothing); this
-		// states the requirement directly so a refactor that stops
-		// wrapping the caps fails with a reason, not a coverage riddle.
-		for _, cap := range []string{"Debounce", "Quota"} {
-			if !rec.Recorded(cap, "ShouldDefer") {
-				t.Errorf("diagram must show %s.ShouldDefer — the %s cap is no longer observable", cap, cap)
-			}
-		}
 	})
 }
