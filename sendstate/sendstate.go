@@ -14,8 +14,10 @@
 //     read primitives every policy needs — [Entry.Seen] (content
 //     dedupe) and [Entry.CountSentInWindow] (the per-window send count
 //     [pith/coalesce.Coalescer] thresholds against) — so a single
-//     ReadEntry drives a whole [pith/protect.WriteNamespace.Check] /
-//     [pith/protect.ReadNamespace.Check].
+//     read pass drives a whole [pith/protect.WriteNamespace.CheckAndReserve] /
+//     [pith/protect.ReadNamespace.CheckAndReserve] (the Mongo backend
+//     folds it into a single findOneAndUpdate that decides and reserves
+//     in one atomic op).
 //   - [Metrics] — lifetime observability rollup: TotalSent,
 //     TotalDeferred, LastSentAt, LastDeferredAt. Read via
 //     [Store.ReadMetrics]. Never expires.
@@ -42,10 +44,15 @@
 // the window per-call, so multiple Coalescers (each with their own
 // window) share one read against one consistent now.
 //
-// The contract is record-on-success: callers RecordAsSent only
-// after the gated operation has actually succeeded. RecordAsDeferred
-// is called by [pith/protect.WriteNamespace.Check] /
-// [pith/protect.ReadNamespace.Check] itself when any attached
+// The send-side recording contract is optimistic-reserve-and-undo:
+// CheckAndReserve atomically reserves the send-slot (appends a timestamp
+// to LastNSendTimes) on a Proceed decision; the returned ReleaseFunc
+// pops that timestamp by value if the gated op subsequently fails.
+// The legacy RecordAsSent path remains for the replay sweep — it
+// records a send-slot directly when a replay re-takes a previously
+// deferred read, so the entry stops being pending. CheckAndReserve's
+// deferred path stamps the breadcrumb (LastDeferredMessageRef +
+// LastNDeferredTimes) as part of the same atomic op when any attached
 // Coalescer's ShouldDefer returns true.
 //
 // # TTL semantics
@@ -87,6 +94,7 @@ import (
 	"time"
 
 	"github.com/homemade/pith/coalesce"
+	"github.com/homemade/pith/protect"
 )
 
 // Entry is the per-key working state read by policies. It carries the
@@ -159,8 +167,8 @@ func (e Entry) Seen(contentHash string) bool {
 
 // CountSentInWindow returns the number of send timestamps in
 // LastNSendTimes within the trailing window ending at now. now is the
-// caller's reference time (typically captured once per Check and
-// shared across every policy). Pure; no I/O.
+// caller's reference time (typically captured once per CheckAndReserve
+// and shared across every policy). Pure; no I/O.
 func (e Entry) CountSentInWindow(now time.Time, window time.Duration) int {
 	return countInWindow(e.LastNSendTimes, now, window)
 }
@@ -374,16 +382,19 @@ type ReserveResult struct {
 
 // Store is the shared per-key send-state store. [Store.ReadEntry]
 // drives the policies ([Entry.Seen], [pith/coalesce.Coalescer.ShouldDefer]);
-// [Store.ReadMetrics] serves observability. Writes come from
-// [pith/protect.WriteNamespace.RecordAsSent] /
-// [pith/protect.ReadNamespace.RecordAsSent] (on successful sends),
-// [pith/protect.WriteNamespace.Check] / [pith/protect.ReadNamespace.Check]
-// (on Coalescer-driven deferrals), and the atomic
-// [Store.CheckAndReserve] primitive that closes the TOCTOU window
-// between today's read-only Check and its follow-up RecordAsSent (the
-// reserve-before-call path used by the protect-layer
+// [Store.ReadMetrics] serves observability. The primary write path is the
+// atomic [Store.CheckAndReserve] primitive — it reads the entry, evaluates
+// dedupe + every Coalescer, and either reserves a send-slot (Proceed),
+// stamps a deferred breadcrumb (Deferred), or returns Deduped, all as a
+// single backing-store op. The protect-layer
 // [pith/protect.WriteNamespace.CheckAndReserve] /
-// [pith/protect.ReadNamespace.CheckAndReserve]).
+// [pith/protect.ReadNamespace.CheckAndReserve] wrap it. The legacy
+// [Store.RecordAsSent] write path remains for the replay sweep: when a
+// replay re-takes a previously deferred read, it records the send-slot
+// directly so the entry stops being pending. [Store.RecordAsDeferred]
+// exists for the caller to stamp a breadcrumb out-of-band (e.g. after a
+// wire-failure under a Proceed, where the slot has been released and the
+// caller wants the replay sweep to re-drive once a hold clears).
 type Store interface {
 	// RecordAsSent stores (key → contentHash) stamped at now, appends
 	// a timestamp to the key's LastNSendTimes, refreshes the Entry
@@ -421,9 +432,9 @@ type Store interface {
 	//     [Entry], nil err). The zero Entry reads as "nothing sent",
 	//     so policies naturally proceed.
 	//   - A backing-store failure returns (zero [Entry], non-nil err).
-	//     Callers fail-open (proceed) and surface the err for logging
-	//     — see [pith/protect.WriteNamespace.Check] /
-	//     [pith/protect.ReadNamespace.Check].
+	//     [Store.CheckAndReserve] consults this read and fails closed
+	//     (DecisionDeferred + Err set) on a non-nil err, preserving cap
+	//     discipline; the replay sweep then re-drives.
 	//
 	// Backends honor the TTL on read (treat expired as absent) rather
 	// than relying on deletion timing, so both backends answer
@@ -456,8 +467,9 @@ type Store interface {
 	// limit budget of every sweep.
 	//
 	// fn does the consumer-specific work — re-derive the payload from
-	// the ref, re-emit via Check, and on a successful send RecordAsSent
-	// (recency then makes the key no longer pending). pith provides no
+	// the ref, re-emit via CheckAndReserve (or directly RecordAsSent
+	// for a read-side replay that just needs to mark the entry sent);
+	// recency then makes the key no longer pending. pith provides no
 	// orchestration beyond this enumeration.
 	RangeDeferred(ctx context.Context, limit int, namespace string, fn func(key string, e Entry) bool) error
 
@@ -518,4 +530,28 @@ type Store interface {
 	// trailing window slides it out (bounded by the largest attached
 	// Coalescer's window). Callers log and continue; never panic.
 	ReleaseReservation(ctx context.Context, key string, reservedAt time.Time) error
+
+	// PlaceHold appends a hold entry to the tenant's audit log. The hold
+	// is active from `from` (inclusive) until `to` (exclusive); a zero
+	// `from` is treated as "now" by the storage layer. `setAt` is
+	// stamped server-side. Atomic — concurrent PlaceHold calls each
+	// contribute their own entry without conflict. See
+	// [pith/protect.WriteTenant.PlaceOnHold] /
+	// [pith/protect.ReadTenant.PlaceOnHold] for the public contract.
+	PlaceHold(ctx context.Context, tenant string, from, to time.Time, reason string) error
+
+	// ClearActiveHolds atomically stamps `ClearedAt = now` on every
+	// currently-active hold on this tenant (entries where
+	// `From ≤ now < To AND ClearedAt is zero`). Expired or
+	// already-cleared entries are left alone. The cleared entries
+	// remain in the audit array — the holds log is append-only.
+	ClearActiveHolds(ctx context.Context, tenant string) error
+
+	// MostRestrictiveActiveHold reports whether tenant has any
+	// currently-active hold and, if so, returns the entry with the
+	// latest `To` (the most-restrictive active window). `active=false`
+	// is paired with the zero Hold. Fails open on store error
+	// (`false, Hold{}, err`) so a caller treating `active=false` as "no
+	// hold" proceeds rather than blocking on a degraded backend.
+	MostRestrictiveActiveHold(ctx context.Context, tenant string) (active bool, hold protect.Hold, err error)
 }

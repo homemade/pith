@@ -10,7 +10,7 @@
 // contract pith/sendstate/mongodb godoc on WithMaxSendTimes flags as the
 // caller's responsibility). These constructors close that gap by
 // deriving the value from the attached Coalescers — the same ones that
-// drive Check's policy evaluation.
+// drive CheckAndReserve's policy evaluation.
 //
 // Both constructors require a caller-owned [*mongo.Client] (configured
 // with majority write concern; see [pith/sendstate/mongodb]) and at least

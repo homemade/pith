@@ -120,10 +120,12 @@ func TestReleaseRestoresSlot(t *testing.T) {
 		t.Fatalf("first CheckAndReserve = %s (release nil? %v); want Proceed + non-nil release", out.Decision, release == nil)
 	}
 
-	// Without releasing first, a follow-up with NEW content would
-	// debounce (leading-edge cap=1 in this window).
-	if out := w.Check(ctx, meta, "h2"); out.Decision != protect.DecisionDeferred {
-		t.Fatalf("pre-release Check = %s, want Deferred (cap held by reserve)", out.Decision)
+	// Without releasing first, a follow-up reserve with NEW content
+	// would debounce (leading-edge cap=1 in this window). The reserve
+	// would stamp a deferred breadcrumb, but that's a no-op on top of
+	// the already-deferred state; we only assert the Decision.
+	if out, _ := w.CheckAndReserve(ctx, meta, "h2"); out.Decision != protect.DecisionDeferred {
+		t.Fatalf("pre-release CheckAndReserve = %s, want Deferred (cap held by reserve)", out.Decision)
 	}
 
 	// Release rolls the reservation back. The next reserve should proceed.
@@ -169,8 +171,8 @@ func TestReleaseByValueSpartsSiblingReserve(t *testing.T) {
 
 	// Both reserves at cap. A new attempt should defer (cap=2 reached).
 	metaC := protect.RequestMeta{TargetKey: "k-shared"}
-	if out := w.Check(ctx, metaC, "hC"); out.Decision != protect.DecisionDeferred {
-		t.Fatalf("at-cap Check = %s, want Deferred", out.Decision)
+	if out, _ := w.CheckAndReserve(ctx, metaC, "hC"); out.Decision != protect.DecisionDeferred {
+		t.Fatalf("at-cap CheckAndReserve = %s, want Deferred", out.Decision)
 	}
 
 	// Release ONLY A — by value, so B's slot survives. A new reserve
@@ -188,8 +190,8 @@ func TestReleaseByValueSpartsSiblingReserve(t *testing.T) {
 
 	// And critically, the next attempt should AGAIN defer — B's slot
 	// is intact, so cap is back at 2.
-	if out := w.Check(ctx, metaC, "hD"); out.Decision != protect.DecisionDeferred {
-		t.Fatalf("after C reserves, Check = %s, want Deferred (B still holds a slot)", out.Decision)
+	if out, _ := w.CheckAndReserve(ctx, metaC, "hD"); out.Decision != protect.DecisionDeferred {
+		t.Fatalf("after C reserves, CheckAndReserve = %s, want Deferred (B still holds a slot)", out.Decision)
 	}
 }
 
@@ -248,13 +250,14 @@ func TestConcurrentReservesCannotOvershoot(t *testing.T) {
 // hash and the gated op subsequently fails, calling the release closure
 // must leave the dedupe gate inert so an identical retry can proceed.
 //
-// This is the "record-on-success" invariant raisortto's webhook handler
-// depends on (Raisely re-delivers identical webhooks on a 5xx; the retry
-// must not be dedupe-suppressed when the original send failed). The
-// memory backend gets this for free via [sendstate.Entry.Seen]'s
-// len(LastNSendTimes) == 0 → false guard; this test pins that semantic
-// so a future refactor can't silently regress it. The mirroring Mongo
-// test lives in protect/mongodb/checkandreserve_test.go.
+// This is the "record-on-success" invariant that consumers driven by an
+// upstream that re-delivers on transient failure (a typical webhook
+// source) depend on — an identical retry after a failed send must not
+// be dedupe-suppressed. The memory backend gets this for free via
+// [sendstate.Entry.Seen]'s len(LastNSendTimes) == 0 → false guard; this
+// test pins that semantic so a future refactor can't silently regress
+// it. The mirroring Mongo test lives in
+// protect/mongodb/checkandreserve_test.go.
 func TestReleaseClearsDedupeForIdenticalRetry(t *testing.T) {
 	// Wide quota so dedupe is the only suppressor under test.
 	p := memprotect.NewWriteProtector(
@@ -281,7 +284,7 @@ func TestReleaseClearsDedupeForIdenticalRetry(t *testing.T) {
 		t.Fatalf("release: %v", err)
 	}
 
-	// Raisely's identical retry: same target, same content. Must proceed
+	// Upstream's identical retry: same target, same content. Must proceed
 	// — a "duplicate" verdict here would lose the work the original wire
 	// call failed to deliver.
 	out2, release2 := w.CheckAndReserve(ctx, meta, "h1")
@@ -300,27 +303,8 @@ func TestReleaseClearsDedupeForIdenticalRetry(t *testing.T) {
 	}
 }
 
-// TestExistingCheckPathUnchanged is a regression guard: after adding the
-// CheckAndReserve method, the legacy Check + RecordAsSent flow must still
-// produce identical outcomes to its pre-Phase-1 behaviour (Proceed → record
-// → Deduped on same content; defer on cap). The smoke test pins it.
-func TestExistingCheckPathUnchanged(t *testing.T) {
-	const debounce = 30 * time.Millisecond
-	p := memprotect.NewWriteProtector(time.Hour, coalesce.NewLeadingEdgeDebounce(debounce))
-	ctx := context.Background()
-	w := p.Tenant("").Namespace("")
-	meta := protect.RequestMeta{TargetKey: "k-legacy"}
-
-	if out := w.Check(ctx, meta, "h1"); out.Decision != protect.DecisionProceed {
-		t.Fatalf("legacy Check = %s, want Proceed", out.Decision)
-	}
-	if err := w.RecordAsSent(ctx, meta, "h1"); err != nil {
-		t.Fatalf("RecordAsSent: %v", err)
-	}
-	if out := w.Check(ctx, meta, "h1"); out.Decision != protect.DecisionDeduped {
-		t.Fatalf("legacy repeat Check = %s, want Deduped", out.Decision)
-	}
-	if out := w.Check(ctx, meta, "h2"); out.Decision != protect.DecisionDeferred {
-		t.Fatalf("legacy new-content Check = %s, want Deferred (debounce)", out.Decision)
-	}
-}
+// (TestExistingCheckPathUnchanged was a Phase 1 regression guard pinning
+// the legacy Check + RecordAsSent flow alongside CheckAndReserve. Phase
+// 2a removed Check from the public namespace interfaces, so the guard
+// has no method to exercise; CheckAndReserve outcomes are pinned by
+// TestWriteCheckAndReserveOutcomes earlier in this file.)

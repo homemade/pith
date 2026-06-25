@@ -135,8 +135,8 @@ func TestMongoReleaseByValueSpartsSiblingReserve(t *testing.T) {
 	_ = releaseB
 
 	// Both reserves hold the cap. New attempt should defer.
-	if out := w.Check(ctx, metaA, "hC"); out.Decision != protect.DecisionDeferred {
-		t.Fatalf("at-cap Check = %s, want Deferred", out.Decision)
+	if out, _ := w.CheckAndReserve(ctx, metaA, "hC"); out.Decision != protect.DecisionDeferred {
+		t.Fatalf("at-cap CheckAndReserve = %s, want Deferred", out.Decision)
 	}
 
 	// Release A by value — B's slot must survive.
@@ -148,8 +148,8 @@ func TestMongoReleaseByValueSpartsSiblingReserve(t *testing.T) {
 		t.Fatalf("post-releaseA CheckAndReserve = %s, want Proceed (A's slot freed)", outC.Decision)
 	}
 	// And B's slot is still there — cap is back at 2.
-	if out := w.Check(ctx, metaA, "hD"); out.Decision != protect.DecisionDeferred {
-		t.Fatalf("after C reserves, Check = %s, want Deferred (B's slot intact)", out.Decision)
+	if out, _ := w.CheckAndReserve(ctx, metaA, "hD"); out.Decision != protect.DecisionDeferred {
+		t.Fatalf("after C reserves, CheckAndReserve = %s, want Deferred (B's slot intact)", out.Decision)
 	}
 }
 
@@ -228,10 +228,10 @@ func TestMongoConcurrentReservesCannotOvershoot(t *testing.T) {
 // BOTH contentHash equality AND lastNSendTimes being non-empty — mirroring
 // the memory backend's [sendstate.Entry.Seen] len-guard. Without that
 // guard the dedupe gate fires on the retry (contentHash is preserved
-// across a $pull-by-value release) and the work is lost. raisortto's
-// webhook handler depends on this — Raisely re-delivers identical
-// webhooks on a 5xx; the retry must not be dedupe-suppressed when the
-// original send failed.
+// across a $pull-by-value release) and the work is lost. Consumers
+// driven by an upstream that re-delivers on transient failure (a typical
+// webhook source) depend on this — an identical retry after a failed
+// send must not be dedupe-suppressed.
 func TestMongoReleaseClearsDedupeForIdenticalRetry(t *testing.T) {
 	if testClient == nil {
 		t.Skip("no MongoDB container (Docker unavailable)")
@@ -268,7 +268,7 @@ func TestMongoReleaseClearsDedupeForIdenticalRetry(t *testing.T) {
 		t.Fatalf("release: %v", err)
 	}
 
-	// Raisely's identical retry: same target, same content. Must proceed
+	// Upstream's identical retry: same target, same content. Must proceed
 	// — the dedupedExpr's lastNSendTimes-size guard keeps the gate inert
 	// despite the preserved contentHash.
 	out2, release2 := w.CheckAndReserve(ctx, meta, "h1")

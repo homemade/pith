@@ -576,10 +576,10 @@ func TestStore_PeaksSkippedAtDedupeFloor(t *testing.T) {
 }
 
 // TestStore_PeakSkippedWhenTTLBelowWindow mirrors the memory backend: a
-// window's peak is only folded when EntryTTL covers it. A 2h-TTL store (the
-// Raisely write-back gate) retains under 24h of send history, so the $set
-// pipeline omits peak24h/peak24hAt entirely — they stay unset (absent, not a
-// deceptive 0) — while peak1h still folds because TTL >= 1h.
+// window's peak is only folded when EntryTTL covers it. A 2h-TTL store
+// retains under 24h of send history, so the $set pipeline omits
+// peak24h/peak24hAt entirely — they stay unset (absent, not a deceptive
+// 0) — while peak1h still folds because TTL >= 1h.
 func TestStore_PeakSkippedWhenTTLBelowWindow(t *testing.T) {
 	s := newStore(t, 2*time.Hour, WithMaxSendTimes(5)) // covers 1h, not 24h
 	ctx := context.Background()

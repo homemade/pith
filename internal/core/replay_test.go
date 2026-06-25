@@ -22,15 +22,15 @@ func TestWriteGate_ReplayCandidates(t *testing.T) {
 	).Tenant("").Namespace("") // untenanted, whole-store; gating happens on the handle
 	meta := protect.RequestMeta{TargetKey: "k1", MessageRef: []byte("ref")}
 
-	// First send proceeds and is recorded.
-	if out := w.Check(ctx, meta, "h1"); out.Decision != protect.DecisionProceed {
-		t.Fatalf("first Check should proceed, got %s", out.Decision)
+	// First send proceeds and is reserved (CheckAndReserve atomically
+	// records on Proceed — no separate RecordAsSent needed).
+	if out, _ := w.CheckAndReserve(ctx, meta, "h1"); out.Decision != protect.DecisionProceed {
+		t.Fatalf("first CheckAndReserve should proceed, got %s", out.Decision)
 	}
-	_ = w.RecordAsSent(ctx, meta, "h1")
 
 	// Second (new content) within the window → debounce defers → pending.
-	if out := w.Check(ctx, meta, "h2"); out.Decision != protect.DecisionDeferred {
-		t.Fatalf("second Check should defer (debounce), got %s", out.Decision)
+	if out, _ := w.CheckAndReserve(ctx, meta, "h2"); out.Decision != protect.DecisionDeferred {
+		t.Fatalf("second CheckAndReserve should defer (debounce), got %s", out.Decision)
 	}
 
 	// Within the window: caps not clear → not returned.

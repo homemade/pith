@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/homemade/pith/protect"
 	"github.com/homemade/pith/sendstate"
 )
 
@@ -48,6 +49,17 @@ type Store struct {
 	entries sync.Map      // key: string → value: *entryRecord (TTL'd)
 	metrics sync.Map      // key: string → value: *sendstate.Metrics (permanent)
 	ops     atomic.Uint64
+
+	// holds is the per-tenant audit log of every hold ever placed,
+	// across every state (active / naturally-expired / explicitly
+	// cleared). Append-only — no TTL — the array preserves the full
+	// audit trail. holdsMu guards both the map and the slices it
+	// points at; concurrent PlaceHold / ClearActiveHolds /
+	// MostRestrictiveActiveHold calls serialise on it. The lock cost
+	// is negligible against pith's actual hold cadence (rare
+	// rate-limit events / operator actions).
+	holdsMu sync.Mutex
+	holds   map[string][]protect.Hold
 }
 
 // maxSendTimes is the effective cap, applying [defaultMaxSendTimes]
@@ -707,6 +719,78 @@ func (m *Store) maybeSweep() {
 	if m.ops.Add(1)%1000 == 0 {
 		m.sweep()
 	}
+}
+
+// PlaceHold appends a hold to tenant's audit log. Atomic via holdsMu.
+// `from.IsZero()` is treated as `now`; `setAt` is stamped server-side
+// at append time.
+func (m *Store) PlaceHold(_ context.Context, tenant string, from, to time.Time, reason string) error {
+	now := time.Now()
+	if from.IsZero() {
+		from = now
+	}
+	m.holdsMu.Lock()
+	defer m.holdsMu.Unlock()
+	if m.holds == nil {
+		m.holds = make(map[string][]protect.Hold)
+	}
+	m.holds[tenant] = append(m.holds[tenant], protect.Hold{
+		From:   from,
+		To:     to,
+		Reason: reason,
+		SetAt:  now,
+	})
+	return nil
+}
+
+// ClearActiveHolds stamps `ClearedAt = now` on every currently-active
+// hold on tenant (entries where `From ≤ now < To AND ClearedAt is
+// zero`). Atomic via holdsMu. Expired / already-cleared entries are
+// left alone — the audit array preserves the full lifecycle.
+func (m *Store) ClearActiveHolds(_ context.Context, tenant string) error {
+	now := time.Now()
+	m.holdsMu.Lock()
+	defer m.holdsMu.Unlock()
+	hs := m.holds[tenant]
+	for i := range hs {
+		h := &hs[i]
+		if !h.ClearedAt.IsZero() {
+			continue // already cleared
+		}
+		if h.From.After(now) || !h.To.After(now) {
+			continue // not active (future or expired)
+		}
+		h.ClearedAt = now
+	}
+	return nil
+}
+
+// MostRestrictiveActiveHold reports whether tenant has any
+// currently-active hold and, if so, returns the entry with the latest
+// `To`. Reads under holdsMu so a concurrent PlaceHold / ClearActiveHolds
+// either fully precedes or fully follows the read.
+func (m *Store) MostRestrictiveActiveHold(_ context.Context, tenant string) (bool, protect.Hold, error) {
+	now := time.Now()
+	m.holdsMu.Lock()
+	defer m.holdsMu.Unlock()
+	var best protect.Hold
+	active := false
+	for _, h := range m.holds[tenant] {
+		if !h.ClearedAt.IsZero() {
+			continue
+		}
+		if h.From.After(now) || !h.To.After(now) {
+			continue
+		}
+		if !active || h.To.After(best.To) {
+			best = h
+			active = true
+		}
+	}
+	if !active {
+		return false, protect.Hold{}, nil
+	}
+	return true, best, nil
 }
 
 // sweep is the in-memory equivalent of the Entry collection's Mongo

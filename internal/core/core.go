@@ -13,8 +13,8 @@
 // (a leaf package); core imports them and supplies the only implementation —
 // the concrete gate shells plus the blessed NewRead / NewWrite constructors.
 // The architectural notes that users read — the read/write split, the
-// Check/RecordAsSent contract, deferred breadcrumbs, replay — live on
-// [pith/protect] (where users find them).
+// CheckAndReserve / replay contract, deferred breadcrumbs, tenant holds —
+// live on [pith/protect] (where users find them).
 package core
 
 import (
@@ -44,9 +44,10 @@ type gate struct {
 }
 
 // scopedGate binds a *gate to a (tenant, namespace) pair. The gating methods
-// (check / record / replay) live here, so the scope is fixed once on the
-// handle and can't diverge between the Check that defers and the sweep that
-// drains. "" tenant is untenanted; "" namespace is the whole store.
+// (CheckAndReserve / record / replay) live here, so the scope is fixed once
+// on the handle and can't diverge between the CheckAndReserve that defers
+// and the sweep that drains. "" tenant is untenanted; "" namespace is the
+// whole store.
 type scopedGate struct {
 	*gate
 	tenant    string
@@ -88,20 +89,38 @@ func (r ReadTenantGate) Namespace(ns string) protect.ReadNamespace {
 	return ReadNamespaceGate{&scopedGate{gate: r.gate, tenant: r.tenant, namespace: ns}}
 }
 
-// ReadNamespaceGate is a [ReadGate] scoped to one namespace: Check / RecordAsSent
-// / ReplayCandidates all operate within it. Satisfies [pith/protect.ReadNamespace].
-type ReadNamespaceGate struct{ *scopedGate }
-
-// Check gates a candidate read. Returns DecisionProceed or, on a Coalescer
-// cap, DecisionDeferred (a breadcrumb is stamped for the replay sweep). Never
-// DecisionDeduped (no dedupe layer).
-func (r ReadNamespaceGate) Check(ctx context.Context, meta protect.RequestMeta) protect.Outcome {
-	return r.check(ctx, meta, "")
+// PlaceOnHold appends a hold to the bound tenant's audit log. See
+// [protect.ReadTenant.PlaceOnHold] for the contract.
+func (r ReadTenantGate) PlaceOnHold(ctx context.Context, from, to time.Time, reason string) error {
+	return r.store.PlaceHold(ctx, r.tenant, from, to, reason)
 }
+
+// ClearActiveHolds stamps `ClearedAt = now` on every currently-active
+// hold on the bound tenant. See [protect.ReadTenant.ClearActiveHolds].
+func (r ReadTenantGate) ClearActiveHolds(ctx context.Context) error {
+	return r.store.ClearActiveHolds(ctx, r.tenant)
+}
+
+// HasActiveHold reports whether the bound tenant has any currently-active
+// hold. Fails open on store error. See [protect.ReadTenant.HasActiveHold].
+func (r ReadTenantGate) HasActiveHold(ctx context.Context) (bool, protect.Hold, error) {
+	return r.store.MostRestrictiveActiveHold(ctx, r.tenant)
+}
+
+// ReadNamespaceGate is a [ReadGate] scoped to one namespace:
+// CheckAndReserve / RecordAsSent / ReplayCandidates all operate within
+// it. Satisfies [pith/protect.ReadNamespace].
+type ReadNamespaceGate struct{ *scopedGate }
 
 // RecordAsSent commits a performed read, advancing the Coalescer counts.
 func (r ReadNamespaceGate) RecordAsSent(ctx context.Context, meta protect.RequestMeta) error {
 	return r.record(ctx, meta, "")
+}
+
+// RecordAsDeferred stamps a deferred breadcrumb on the entry. See
+// [protect.ReadNamespace.RecordAsDeferred] for the contract.
+func (r ReadNamespaceGate) RecordAsDeferred(ctx context.Context, meta protect.RequestMeta) error {
+	return r.store.RecordAsDeferred(ctx, meta.TargetKey, r.tenant, r.namespace, meta.MessageRef)
 }
 
 // ReplayCandidates collects pending deferred reads in this namespace whose
@@ -110,10 +129,11 @@ func (r ReadNamespaceGate) ReplayCandidates(ctx context.Context, limit int) ([]p
 	return r.replay(ctx, limit)
 }
 
-// CheckAndReserve is the atomic cap-discipline counterpart to Check +
-// RecordAsSent. See [protect.ReadNamespace.CheckAndReserve] for the
-// contract — two outcomes (Proceed / Deferred), fail-closed on store
-// error, ReleaseFunc rolls back a Proceed reservation on op failure.
+// CheckAndReserve evaluates every attached Coalescer and — on a Proceed
+// — atomically reserves a send-slot. See
+// [protect.ReadNamespace.CheckAndReserve] for the contract — two
+// outcomes (Proceed / Deferred), fail-closed on store error, ReleaseFunc
+// rolls back a Proceed reservation on op failure.
 func (r ReadNamespaceGate) CheckAndReserve(ctx context.Context, meta protect.RequestMeta) (protect.Outcome, protect.ReleaseFunc) {
 	return r.checkAndReserve(ctx, meta, "")
 }
@@ -143,6 +163,24 @@ type WriteTenantGate struct {
 	tenant string // "" = untenanted
 }
 
+// PlaceOnHold appends a hold to the bound tenant's audit log. See
+// [protect.WriteTenant.PlaceOnHold] for the contract.
+func (w WriteTenantGate) PlaceOnHold(ctx context.Context, from, to time.Time, reason string) error {
+	return w.store.PlaceHold(ctx, w.tenant, from, to, reason)
+}
+
+// ClearActiveHolds stamps `ClearedAt = now` on every currently-active
+// hold on the bound tenant. See [protect.WriteTenant.ClearActiveHolds].
+func (w WriteTenantGate) ClearActiveHolds(ctx context.Context) error {
+	return w.store.ClearActiveHolds(ctx, w.tenant)
+}
+
+// HasActiveHold reports whether the bound tenant has any currently-active
+// hold. Fails open on store error. See [protect.WriteTenant.HasActiveHold].
+func (w WriteTenantGate) HasActiveHold(ctx context.Context) (bool, protect.Hold, error) {
+	return w.store.MostRestrictiveActiveHold(ctx, w.tenant)
+}
+
 // Namespace returns a write handle scoped to ns ("" = the whole store).
 // Stamps this WriteTenantGate's tenant alongside the namespace on every write
 // it commits.
@@ -150,21 +188,20 @@ func (w WriteTenantGate) Namespace(ns string) protect.WriteNamespace {
 	return WriteNamespaceGate{&scopedGate{gate: w.gate, tenant: w.tenant, namespace: ns}}
 }
 
-// WriteNamespaceGate is a [WriteGate] scoped to one namespace: Check /
-// RecordAsSent / ReplayCandidates all operate within it. Satisfies
-// [pith/protect.WriteNamespace].
+// WriteNamespaceGate is a [WriteGate] scoped to one namespace:
+// CheckAndReserve / RecordAsSent / ReplayCandidates all operate within
+// it. Satisfies [pith/protect.WriteNamespace].
 type WriteNamespaceGate struct{ *scopedGate }
-
-// Check gates a candidate write. Returns DecisionProceed, DecisionDeduped
-// (identical content), or DecisionDeferred (a Coalescer cap fired — a
-// breadcrumb is stamped for the replay sweep).
-func (w WriteNamespaceGate) Check(ctx context.Context, meta protect.RequestMeta, contentHash string) protect.Outcome {
-	return w.check(ctx, meta, contentHash)
-}
 
 // RecordAsSent commits a successful write (TargetKey → contentHash).
 func (w WriteNamespaceGate) RecordAsSent(ctx context.Context, meta protect.RequestMeta, contentHash string) error {
 	return w.record(ctx, meta, contentHash)
+}
+
+// RecordAsDeferred stamps a deferred breadcrumb on the entry. See
+// [protect.WriteNamespace.RecordAsDeferred] for the contract.
+func (w WriteNamespaceGate) RecordAsDeferred(ctx context.Context, meta protect.RequestMeta) error {
+	return w.store.RecordAsDeferred(ctx, meta.TargetKey, w.tenant, w.namespace, meta.MessageRef)
 }
 
 // ReplayCandidates collects pending deferrals in this namespace whose Coalescer
@@ -173,11 +210,11 @@ func (w WriteNamespaceGate) ReplayCandidates(ctx context.Context, limit int) ([]
 	return w.replay(ctx, limit)
 }
 
-// CheckAndReserve is the atomic cap-discipline counterpart to Check +
-// RecordAsSent. See [protect.WriteNamespace.CheckAndReserve] for the
-// contract — three outcomes (Proceed / Deduped / Deferred), fail-closed
-// on store error, ReleaseFunc rolls back a Proceed reservation on op
-// failure.
+// CheckAndReserve evaluates dedupe and every attached Coalescer and — on
+// a Proceed — atomically reserves a send-slot. See
+// [protect.WriteNamespace.CheckAndReserve] for the contract — three
+// outcomes (Proceed / Deduped / Deferred), fail-closed on store error,
+// ReleaseFunc rolls back a Proceed reservation on op failure.
 func (w WriteNamespaceGate) CheckAndReserve(ctx context.Context, meta protect.RequestMeta, contentHash string) (protect.Outcome, protect.ReleaseFunc) {
 	return w.checkAndReserve(ctx, meta, contentHash)
 }
@@ -225,8 +262,8 @@ func LargestHardCap(coalescers ...coalesce.Coalescer) int {
 //     largest hardCap so the send-timestamp list can't undercount.
 //
 // Coalescer names (from [coalesce.Coalescer.Name]) must be unique —
-// Check surfaces the name in Outcome.Reason, so two caps sharing a name
-// would be ambiguous (panic on collision).
+// CheckAndReserve surfaces the name in Outcome.Reason, so two caps sharing
+// a name would be ambiguous (panic on collision).
 func newGate(store sendstate.Store, dedupe bool, coalescers []coalesce.Coalescer) *gate {
 	if store == nil {
 		panic("protect: a gate requires a non-nil store")
@@ -264,48 +301,6 @@ func newGate(store sendstate.Store, dedupe bool, coalescers []coalesce.Coalescer
 	return &gate{store: store, coalescers: coalescers, dedupe: dedupe}
 }
 
-// check applies dedupe (write gates only) and each attached Coalescer in
-// order and returns the first suppression. One [sendstate.Store.ReadEntry]
-// read drives every policy — dedupe and each Coalescer evaluate against
-// the same [sendstate.Entry], anchored at a single now. Coalescer counts
-// advance only when record appends to the store on a successful send.
-//
-//   - DecisionProceed: perform the operation, then call record on success.
-//     No store write on this path.
-//   - DecisionDeduped: dedupe matched the last send's contentHash (write
-//     gates only). No store write — nothing to replay.
-//   - DecisionDeferred: a Coalescer cap fired. Check stamps a deferred
-//     breadcrumb for the consumer sweep and returns DecisionDeferred — read
-//     and write gates alike.
-//
-// Backing-store errors are fail-open via [protect.Outcome.Err]: a ReadEntry
-// failure yields (DecisionProceed, Err); a failed RecordAsDeferred stamp
-// still yields DecisionDeferred with the error attached.
-func (g *scopedGate) check(ctx context.Context, meta protect.RequestMeta, contentHash string) protect.Outcome {
-	now := time.Now()
-	entry, err := g.store.ReadEntry(ctx, meta.TargetKey)
-	if err != nil {
-		return protect.Outcome{Decision: protect.DecisionProceed, Err: err}
-	}
-
-	// Layer 1: content dedupe (write gates only).
-	if g.dedupe && entry.Seen(contentHash) {
-		return protect.Outcome{Decision: protect.DecisionDeduped, Reason: "duplicate content"}
-	}
-
-	// Layer 2: each attached Coalescer in order. The deferral stamps this
-	// handle's tenant + namespace so the replay sweep can scope to namespace
-	// and observability can group by tenant.
-	for _, c := range g.coalescers {
-		if c.ShouldDefer(entry, now) {
-			recErr := g.store.RecordAsDeferred(ctx, meta.TargetKey, g.tenant, g.namespace, meta.MessageRef)
-			return protect.Outcome{Decision: protect.DecisionDeferred, Reason: c.Name(), Err: recErr}
-		}
-	}
-
-	return protect.Outcome{Decision: protect.DecisionProceed}
-}
-
 // record commits a successful send: writes (TargetKey → contentHash) to
 // the store, appending a timestamp to the rolling send list and
 // incrementing TotalSent. Read gates pass an empty contentHash. It stamps this
@@ -332,8 +327,9 @@ func (g *scopedGate) record(ctx context.Context, meta protect.RequestMeta, conte
 // The gate covers only the caps (pure CountSentInWindow /
 // CountDeferredInWindow arithmetic, no I/O). Dedupe is not applied here —
 // on a write gate it still runs when the consumer re-emits each candidate
-// via [WriteNamespaceGate.Check]; a read gate ([ReadNamespaceGate.Check]) has
-// no dedupe and re-takes the read against current state.
+// via [WriteNamespaceGate.CheckAndReserve]; a read gate
+// ([ReadNamespaceGate.CheckAndReserve]) has no dedupe and re-takes the
+// read against current state.
 func (g *scopedGate) replay(ctx context.Context, limit int) ([]protect.DeferredRequest, error) {
 	var out []protect.DeferredRequest
 	err := g.store.RangeDeferred(ctx, limit, g.namespace, func(key string, e sendstate.Entry) bool {

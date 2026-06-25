@@ -124,20 +124,22 @@ func TestNewWriteProtector_AutoDerivesMaxSendTimesFromCoalescers(t *testing.T) {
 		_ = testClient.Database(dbName).Drop(context.Background())
 	})
 
-	// Functional check: a Check + RecordAsSent round-trip works.
+	// Functional check: a CheckAndReserve round-trip works (the reserve
+	// IS the record on a Proceed).
 	w := p.Tenant("").Namespace("") // untenanted, whole-store; gating happens on the handle
 	meta := protect.RequestMeta{TargetKey: "k1"}
-	if out := w.Check(ctx, meta, "h1"); out.Decision != protect.DecisionProceed || out.Err != nil {
-		t.Fatalf("first Check = %s, err=%v; want Proceed", out.Decision, out.Err)
+	out, release := w.CheckAndReserve(ctx, meta, "h1")
+	if out.Decision != protect.DecisionProceed || out.Err != nil {
+		t.Fatalf("first CheckAndReserve = %s, err=%v; want Proceed", out.Decision, out.Err)
 	}
-	if err := w.RecordAsSent(ctx, meta, "h1"); err != nil {
-		t.Fatalf("RecordAsSent: %v", err)
+	if release == nil {
+		t.Fatal("first CheckAndReserve: release is nil on Proceed")
 	}
 
 	// Identical content → dedupe trips. Confirms the protector and store
 	// are wired up end-to-end.
-	if out := w.Check(ctx, meta, "h1"); out.Decision != protect.DecisionDeduped {
-		t.Fatalf("repeat Check = %s, want Deduped", out.Decision)
+	if out2, _ := w.CheckAndReserve(ctx, meta, "h1"); out2.Decision != protect.DecisionDeduped {
+		t.Fatalf("repeat CheckAndReserve = %s, want Deduped", out2.Decision)
 	}
 }
 
@@ -164,16 +166,17 @@ func TestNewReadProtector_DefersAtCap(t *testing.T) {
 
 	rn := r.Tenant("").Namespace("") // untenanted, whole-store; gating happens on the handle
 	meta := protect.RequestMeta{TargetKey: "r1", MessageRef: []byte("ref-1")}
-	if out := rn.Check(ctx, meta); out.Decision != protect.DecisionProceed || out.Err != nil {
-		t.Fatalf("first Check = %s, err=%v; want Proceed", out.Decision, out.Err)
+	out, release := rn.CheckAndReserve(ctx, meta)
+	if out.Decision != protect.DecisionProceed || out.Err != nil {
+		t.Fatalf("first CheckAndReserve = %s, err=%v; want Proceed", out.Decision, out.Err)
 	}
-	if err := rn.RecordAsSent(ctx, meta); err != nil {
-		t.Fatalf("RecordAsSent: %v", err)
+	if release == nil {
+		t.Fatal("first CheckAndReserve: release is nil on Proceed")
 	}
 	// Quota of 1 is now reached → the next read is DEFERRED (breadcrumb
 	// stamped), not dropped.
-	if out := rn.Check(ctx, meta); out.Decision != protect.DecisionDeferred {
-		t.Fatalf("over-cap Check = %s, want Deferred", out.Decision)
+	if out2, _ := rn.CheckAndReserve(ctx, meta); out2.Decision != protect.DecisionDeferred {
+		t.Fatalf("over-cap CheckAndReserve = %s, want Deferred", out2.Decision)
 	}
 	// The deferral is not yet a replay candidate (the 24h quota window has
 	// not cleared) — but the breadcrumb is recorded.

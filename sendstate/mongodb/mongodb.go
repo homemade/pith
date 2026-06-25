@@ -17,7 +17,8 @@
 //     storage reclamation and never affects an answer, so this backend
 //     matches the memory store regardless of when Mongo's background
 //     deleter runs.
-//   - One read drives a Check: policies read only entries; metrics is
+//   - One atomic op drives a CheckAndReserve: policies read entries and
+//     reserve send-slots in the same findOneAndUpdate; metrics is
 //     observability-only.
 //
 // Cross-instance correctness depends on the *mongo.Client (or one of its
@@ -39,6 +40,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/homemade/pith/coalesce"
+	"github.com/homemade/pith/protect"
 	"github.com/homemade/pith/sendstate"
 )
 
@@ -127,6 +129,7 @@ var _ sendstate.Store = (*Store)(nil)
 type Store struct {
 	entries      *mongo.Collection
 	metrics      *mongo.Collection
+	holds        *mongo.Collection // per-tenant append-only hold audit log; one doc per tenant (_id = tenant)
 	ttl          time.Duration
 	maxSendTimes int // bounds lastNSendTimes/lastNDeferredTimes; must be >= the largest Coalescer hardCap
 }
@@ -159,6 +162,7 @@ func New(db *mongo.Database, entryTTL time.Duration, opts ...Option) *Store {
 	s := &Store{
 		entries: db.Collection("entries"),
 		metrics: db.Collection("metrics"),
+		holds:   db.Collection("holds"),
 		ttl:     entryTTL,
 	}
 	for _, o := range opts {
@@ -425,8 +429,8 @@ func (s *Store) CheckAndReserve(ctx context.Context, req sendstate.ReserveReques
 	}
 
 	// Stage 1 — compute the outcome flag + reason as fields on the doc.
-	// Order: deduped beats deferred beats proceed (matches Check's layer
-	// order). Later stages reference these.
+	// Order: deduped beats deferred beats proceed (matches CheckAndReserve's
+	// layer order). Later stages reference these.
 	stage1 := bson.M{
 		"_reserveOutcome": bson.M{"$cond": bson.A{
 			dedupedExpr, "deduped",
@@ -563,6 +567,133 @@ func (s *Store) ReleaseReservation(ctx context.Context, key string, reservedAt t
 		return nil
 	}
 	return err
+}
+
+// holdEntryDoc is the per-element shape inside a holds doc's array.
+// Mirrors [protect.Hold] field-for-field with bson tags. `omitempty`
+// on `clearedAt` keeps naturally-expired entries free of the field
+// (matching the zero-value contract in protect.Hold's godoc).
+type holdEntryDoc struct {
+	From      time.Time `bson:"from"`
+	To        time.Time `bson:"to"`
+	Reason    string    `bson:"reason"`
+	SetAt     time.Time `bson:"setAt"`
+	ClearedAt time.Time `bson:"clearedAt,omitempty"`
+}
+
+func (d holdEntryDoc) hold() protect.Hold {
+	return protect.Hold{From: d.From, To: d.To, Reason: d.Reason, SetAt: d.SetAt, ClearedAt: d.ClearedAt}
+}
+
+// PlaceHold appends a hold entry to the tenant's audit doc (one doc per
+// tenant, `_id = tenant`). Atomic single-doc upsert via a `$set`
+// aggregation pipeline that computes the resolved `from` (zero → $$NOW)
+// and the `setAt` timestamp server-side, then `$concatArrays` appends
+// onto the existing audit array. Concurrent PlaceHold calls on the same
+// tenant each contribute their own entry; the single-doc update
+// linearises them.
+func (s *Store) PlaceHold(ctx context.Context, tenant string, from, to time.Time, reason string) error {
+	// Server-side resolve of `from` so a zero time passed by the caller
+	// becomes $$NOW at the database, not at this process — mirrors the
+	// memory backend's "from.IsZero() → now" behaviour but anchored to
+	// the DB's clock for cross-instance consistency.
+	resolvedFrom := bson.M{"$cond": bson.A{
+		bson.M{"$eq": bson.A{from, time.Time{}}},
+		"$$NOW",
+		from,
+	}}
+	newEntry := bson.M{
+		"from":   resolvedFrom,
+		"to":     to,
+		"reason": reason,
+		"setAt":  "$$NOW",
+	}
+	pipeline := mongo.Pipeline{
+		{{Key: "$set", Value: bson.M{
+			"holds": bson.M{"$concatArrays": bson.A{
+				bson.M{"$ifNull": bson.A{"$holds", bson.A{}}},
+				bson.A{newEntry},
+			}},
+		}}},
+	}
+	_, err := s.holds.UpdateByID(ctx, tenant, pipeline, options.UpdateOne().SetUpsert(true))
+	return err
+}
+
+// ClearActiveHolds stamps `clearedAt = $$NOW` on every currently-active
+// hold on tenant via a single-doc `$map` aggregation update. Active is
+// defined inline as `from ≤ $$NOW AND to > $$NOW AND clearedAt is not
+// set` — matching the memory backend's filter. Expired or
+// already-cleared entries are left alone.
+func (s *Store) ClearActiveHolds(ctx context.Context, tenant string) error {
+	pipeline := mongo.Pipeline{
+		{{Key: "$set", Value: bson.M{
+			"holds": bson.M{
+				"$map": bson.M{
+					"input": bson.M{"$ifNull": bson.A{"$holds", bson.A{}}},
+					"as":    "h",
+					"in": bson.M{"$cond": bson.A{
+						// active iff: from ≤ $$NOW AND to > $$NOW AND clearedAt is missing/zero
+						bson.M{"$and": bson.A{
+							bson.M{"$lte": bson.A{"$$h.from", "$$NOW"}},
+							bson.M{"$gt": bson.A{"$$h.to", "$$NOW"}},
+							bson.M{"$not": bson.M{"$ifNull": bson.A{"$$h.clearedAt", false}}},
+						}},
+						bson.M{"$mergeObjects": bson.A{"$$h", bson.M{"clearedAt": "$$NOW"}}},
+						"$$h",
+					}},
+				},
+			},
+		}}},
+	}
+	_, err := s.holds.UpdateByID(ctx, tenant, pipeline)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil // no holds doc → nothing to clear
+	}
+	return err
+}
+
+// MostRestrictiveActiveHold reads the tenant's holds doc, filters for
+// currently-active entries, and returns the entry with the latest `to`
+// (most-restrictive). Fails open on store error per the sendstate.Store
+// contract — a missing doc or a backing-store error both yield
+// `(false, Hold{}, …)` so a caller that treats `active=false` as "no
+// hold" proceeds rather than blocking on a degraded backend.
+//
+// The filter happens client-side after a single doc read (rather than a
+// `$filter`+`$sort`+`$first` aggregation) because the audit array is
+// small (operational rate-limit events / operator actions), the
+// returned bytes are bounded by the per-tenant doc, and the
+// implementation stays straightforward.
+func (s *Store) MostRestrictiveActiveHold(ctx context.Context, tenant string) (bool, protect.Hold, error) {
+	var doc struct {
+		Holds []holdEntryDoc `bson:"holds"`
+	}
+	if err := s.holds.FindOne(ctx, bson.M{"_id": tenant}).Decode(&doc); err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return false, protect.Hold{}, nil
+		}
+		return false, protect.Hold{}, err
+	}
+	now := time.Now()
+	var best protect.Hold
+	active := false
+	for _, h := range doc.Holds {
+		if !h.ClearedAt.IsZero() {
+			continue
+		}
+		if h.From.After(now) || !h.To.After(now) {
+			continue
+		}
+		if !active || h.To.After(best.To) {
+			best = h.hold()
+			active = true
+		}
+	}
+	if !active {
+		return false, protect.Hold{}, nil
+	}
+	return true, best, nil
 }
 
 // reserveOutcomeDoc decodes the post-update entry doc with the two extra

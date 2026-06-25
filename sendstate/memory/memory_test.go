@@ -632,11 +632,11 @@ func TestMemoryStore_PeaksSkippedAtDedupeFloor(t *testing.T) {
 }
 
 // TestMemoryStore_PeakSkippedWhenTTLBelowWindow: a window's peak is only
-// folded when the Entry TTL covers it. A 2h-TTL store (e.g. the Raisely
-// write-back gate) retains less than 24h of send history, so Peak24h would
-// be a misleading lower bound that silently resets on idle gaps — it must
-// stay unset (absent, distinguishable from a real 0), while Peak1h still
-// folds because TTL >= 1h.
+// folded when the Entry TTL covers it. A 2h-TTL store retains less than
+// 24h of send history, so Peak24h would be a misleading lower bound that
+// silently resets on idle gaps — it must stay unset (absent,
+// distinguishable from a real 0), while Peak1h still folds because
+// TTL >= 1h.
 func TestMemoryStore_PeakSkippedWhenTTLBelowWindow(t *testing.T) {
 	s := New(2 * time.Hour) // covers the 1h window, not the 24h one
 	s.MaxSendTimes = 5      // above the dedupe floor, so peaks are eligible

@@ -6,7 +6,7 @@ Protect Integration THresholds with Go: per-key cap policies (debounce, quota, c
 
 - [`pith/sendstate`](sendstate/) — shared per-key state split across two stores (mirroring two backend collections): the TTL'd **`Entry`** (content-hash, last-deferred message-ref, rolling send-timestamp list) read via `ReadEntry`, and the permanent **`Metrics`** rollup (lifetime counters + last-sent/deferred times) read via `ReadMetrics`. `Entry` carries the read primitives directly: `Seen(contentHash)` (content dedupe — is this identical to the last send?), `CountSentInWindow(now, window)` (per-window send count), and its deferral mirror `CountDeferredInWindow(now, window)` (deferral cadence, for replay-sweep eligibility — e.g. trailing-edge "gone quiet" == 0). The `Entry` store behaves like a Mongo TTL index (`expireAt` + `expireAfterSeconds: 0`) with TTL-honoring reads, so expiry never affects answers. A send touches only send-side state — a deferral is "pending" purely by being more recent than the last send (nothing is cleared)
 - [`pith/coalesce`](coalesce/) — per-key cap policy ("at most hardCap successful sends per window"); one-method read-only policy (`ShouldDefer`), a pure function over a `sendstate.Entry` (via `Entry.CountSentInWindow`). Multiple Coalescers can be attached at different `(hardCap, window)` pairs
-- [`pith/protect`](protect/) — composition layer exposing **two capability-typed gates**, each a factory: a [`WriteProtector`](protect/) / [`ReadProtector`](protect/) is the root, and gating happens through a mandatory two-step chain `p.Tenant(t).Namespace(ns)` (both `""` are sentinels — untenanted, whole-store) that ends in a `WriteNamespace` / `ReadNamespace` — mirroring a Mongo `Database`→`Collection` with an outer scope above it. A [`WriteNamespace`](protect/) guards a content-bearing operation (send / merge / PATCH): `Check(meta, contentHash)` applies content dedupe (`Entry.Seen`) then each attached Coalescer, returning `DecisionDeduped` on a content match or `DecisionDeferred` on a cap — a deferred write stamps a breadcrumb and is replayable via `ReplayCandidates`. A [`ReadNamespace`](protect/) guards a content-free operation (read / poll / event / trigger): `Check(meta)` applies coalesce caps only (no dedupe, no hash), returning `DecisionDeferred` on a cap — like a write, a capped read stamps a breadcrumb and is replayable via `ReplayCandidates`, except the replay re-fetches *current* state rather than re-emitting a payload (re-reading after the burst settles captures the final value). Both gates defer (not drop) a cap, because a cap can suppress the final, changed state; only dedupe is safe to drop without replay (the duplicate is already at the destination), which is why dedupe is write-only. Pair a read gate with `NewTrailingEdgeDebounce` so a sustained burst collapses to one final read. The replay sweep is **namespace-scoped** — `ReplayCandidates` applies its limit within the handle's namespace, so independently-replayed streams sharing a store are swept fairly and one namespace's backlog can't head-of-line-block another's; streams replayed by *different* consumers still need separate stores. The outer **tenant** in the chain is a labelling field stamped on every `Entry` / `Metrics` write for observability and per-tenant queries, and does not affect sweep scoping or `TargetKey` isolation. Read-only access to per-key state is deliberately off the gate facades — observability and tests read `sendstate.Entry` / `sendstate.Metrics` via `sendstate.Store` directly. See the [godoc](https://pkg.go.dev/github.com/homemade/pith/protect) for the full mechanism set and the Check / RecordAsSent / replay contract.
+- [`pith/protect`](protect/) — composition layer exposing **two capability-typed gates**, each a factory: a [`WriteProtector`](protect/) / [`ReadProtector`](protect/) is the root, and gating happens through a mandatory two-step chain `p.Tenant(t).Namespace(ns)` (both `""` are sentinels — untenanted, whole-store) that returns a `WriteTenant` / `ReadTenant` from the first step and a `WriteNamespace` / `ReadNamespace` from the second — mirroring a Mongo `Database`→`Collection` with an outer scope above it. A [`WriteNamespace`](protect/) guards a content-bearing operation (send / merge / PATCH): `CheckAndReserve(meta, contentHash)` atomically applies content dedupe (`Entry.Seen`) then each attached Coalescer in a single backing-store op, returning `DecisionDeduped` on a content match, `DecisionDeferred` on a cap, or `DecisionProceed` with a slot atomically reserved and a `ReleaseFunc` closure (call it on send failure to pop the reservation by value — preserves "record on success" without TOCTOU). A deferred write stamps a breadcrumb and is replayable via `ReplayCandidates`. A [`ReadNamespace`](protect/) guards a content-free operation (read / poll / event / trigger): `CheckAndReserve(meta)` applies coalesce caps only (no dedupe, no hash), returning `DecisionDeferred` on a cap or `DecisionProceed` with a `ReleaseFunc` — like a write, a capped read stamps a breadcrumb and is replayable via `ReplayCandidates`, except the replay re-fetches *current* state rather than re-emitting a payload (re-reading after the burst settles captures the final value). Both gates defer (not drop) a cap, because a cap can suppress the final, changed state; only dedupe is safe to drop without replay (the duplicate is already at the destination), which is why dedupe is write-only. Pair a read gate with `NewTrailingEdgeDebounce` so a sustained burst collapses to one final read. The replay sweep is **namespace-scoped** — `ReplayCandidates` applies its limit within the handle's namespace, so independently-replayed streams sharing a store are swept fairly and one namespace's backlog can't head-of-line-block another's; streams replayed by *different* consumers still need separate stores. The outer **tenant** in the chain doubles as scope and label: it gates a **tenant-wide hold primitive** (`PlaceOnHold` / `HasActiveHold` / `ClearActiveHolds` on `WriteTenant` / `ReadTenant`, backed by an append-only per-tenant audit log) — useful for honouring downstream rate-limit responses or operator-driven maintenance pauses — and is stamped on every `Entry` / `Metrics` write for observability and per-tenant queries. The tenant does not affect sweep scoping or `TargetKey` isolation. Read-only access to per-key state is deliberately off the gate facades — observability and tests read `sendstate.Entry` / `sendstate.Metrics` via `sendstate.Store` directly. See the [godoc](https://pkg.go.dev/github.com/homemade/pith/protect) for the full mechanism set and the CheckAndReserve / replay / hold contracts.
 
 ## Backends
 
@@ -67,7 +67,7 @@ import (
 client, err := mongo.Connect(options.Client().
     ApplyURI("mongodb+srv://user:pw@cluster.example.com").
     SetWriteConcern(writeconcern.Majority()).
-    SetTimeout(200 * time.Millisecond)) // per-op; Check fails open on overshoot
+    SetTimeout(200 * time.Millisecond)) // per-op; CheckAndReserve fails closed on overshoot
 if err != nil {
     return fmt.Errorf("mongo.Connect: %w", err)
 }
@@ -94,12 +94,14 @@ explicit three-step path.
 
 ### Backend-error behaviour
 
-Backing-store errors from `ReadEntry` (the single read every `Check` makes)
-are **fail-open**: `Check` returns `Outcome{Decision: DecisionProceed, Err: err}`
-so callers over-send rather than dropping work — the error is surfaced via
-`Outcome.Err` for logging. Combined with the Mongo store's `Timeout`, a slow
-or unreachable backend degrades to over-send and bounded latency, never to
-dropped sends.
+Backing-store errors from `CheckAndReserve` are **fail-closed**:
+`CheckAndReserve` returns `Outcome{Decision: DecisionDeferred, Err: err}` and a
+`nil` `ReleaseFunc` (no slot was reserved), so callers defer-and-replay rather
+than risk an unintended overshoot — the error is surfaced via `Outcome.Err`
+for logging. The replay sweep re-drives deferred entries on a subsequent
+invocation, so a transient backend blip doesn't drop work either. Combined
+with the Mongo store's `Timeout`, a slow or unreachable backend degrades to
+bounded-latency deferral, never to dropped sends or silent overshoot.
 
 ## Documentation
 
@@ -122,5 +124,5 @@ external consumers.
 Consumers pin via Go modules:
 
 ```
-require github.com/homemade/pith v1.7.0
+require github.com/homemade/pith v1.8.0
 ```

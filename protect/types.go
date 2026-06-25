@@ -30,20 +30,21 @@ type RequestMeta struct {
 	TargetKey string
 
 	// MessageRef is caller-defined data stored in the sendstate entry's
-	// LastDeferredMessageRef when a Check returns DecisionDeferred (write or
-	// read gate). A sweep layer reads it back to re-derive and re-emit.
-	// Typically a small reference (e.g. an upstream event ID + context,
-	// JSON-encoded). A write sweep re-emits the re-derived payload; a read
-	// sweep re-derives the target and re-fetches current state.
+	// LastDeferredMessageRef when a CheckAndReserve returns
+	// DecisionDeferred (write or read gate). A sweep layer reads it back
+	// to re-derive and re-emit. Typically a small reference (e.g. an
+	// upstream event ID + context, JSON-encoded). A write sweep re-emits
+	// the re-derived payload; a read sweep re-derives the target and
+	// re-fetches current state.
 	MessageRef []byte
 }
 
 // DeferredRequest is the unit yielded by [WriteNamespace.ReplayCandidates] /
 // [ReadNamespace.ReplayCandidates]: a pending deferral whose attached Coalescer
 // caps currently have room to re-emit. It embeds [RequestMeta] (target key +
-// breadcrumb — what the consumer re-derives from and re-emits via Check) and
-// adds the timestamp of the most recent deferral, so the consumer can reason
-// about age without a second read.
+// breadcrumb — what the consumer re-derives from and re-emits via
+// CheckAndReserve) and adds the timestamp of the most recent deferral, so the
+// consumer can reason about age without a second read.
 type DeferredRequest struct {
 	RequestMeta
 
@@ -52,12 +53,15 @@ type DeferredRequest struct {
 	DeferredAt time.Time
 }
 
-// Decision is the outcome of a Check call.
+// Decision is the outcome of a CheckAndReserve call.
 type Decision int
 
 const (
-	// DecisionProceed: caller should perform the gated operation, then
-	// call RecordAsSent on success.
+	// DecisionProceed: caller should perform the gated operation.
+	// CheckAndReserve has atomically reserved the send-slot already, so a
+	// successful op needs no follow-up — the reserve IS the record of the
+	// send. A failed op calls the returned [ReleaseFunc] to pop the
+	// reservation by value.
 	DecisionProceed Decision = iota
 
 	// DecisionDeduped: caller should drop the operation — the content
@@ -69,10 +73,10 @@ const (
 	DecisionDeduped
 
 	// DecisionDeferred: a Coalescer cap pushed back. Reason names the
-	// Coalescer. Check stamps a deferred breadcrumb so a consumer-side sweep
-	// can re-emit once the cap window clears — the deferred operation is one
-	// the caller still intends to perform (a write to retry, or a read to
-	// re-take against current state).
+	// Coalescer. CheckAndReserve stamps a deferred breadcrumb so a
+	// consumer-side sweep can re-emit once the cap window clears — the
+	// deferred operation is one the caller still intends to perform (a
+	// write to retry, or a read to re-take against current state).
 	DecisionDeferred
 )
 
@@ -104,9 +108,9 @@ func (d Decision) String() string {
 // and only invoke the release on the Proceed branch's op-failure path.
 type ReleaseFunc func(ctx context.Context) error
 
-// Outcome reports a Check result. Decision is always actionable; Err carries any
-// backing-store failure encountered along the way (so a caller can log it
-// without losing the policy outcome).
+// Outcome reports a CheckAndReserve result. Decision is always actionable;
+// Err carries any backing-store failure encountered along the way (so a
+// caller can log it without losing the policy outcome).
 type Outcome struct {
 	// Decision is the policy outcome the caller should act on. Always
 	// meaningful, even when Err is non-nil.
@@ -118,11 +122,53 @@ type Outcome struct {
 	Reason string
 
 	// Err is the backing-store error encountered while making the
-	// decision, or nil. A ReadEntry failure fails open (Decision =
-	// DecisionProceed); a failed deferral stamp still yields
+	// decision, or nil. A failed deferral stamp still yields
 	// DecisionDeferred with the error attached. Callers act on Decision
 	// and log Err if set.
 	Err error
+}
+
+// Hold is one entry in the per-tenant holds audit log. The lifecycle
+// has three states:
+//
+//   - **Active**: `From ≤ now < To AND ClearedAt is zero`. Gated ops on
+//     the tenant are suppressed.
+//   - **Naturally expired**: `now ≥ To AND ClearedAt is zero`. The
+//     window passed without a manual clear; entry remains in the audit
+//     array.
+//   - **Explicitly cleared**: `ClearedAt is non-zero`, set by an
+//     operator-driven unpause via [WriteTenant.ClearActiveHolds] /
+//     [ReadTenant.ClearActiveHolds]. The original window is preserved
+//     alongside the clear timestamp for audit.
+//
+// The holds log is append-only with no TTL by design — every hold ever
+// placed is a permanent audit record. [WriteTenant.HasActiveHold] /
+// [ReadTenant.HasActiveHold] return only currently-active entries (the
+// most-restrictive one); the other states are visible only via direct
+// read of the holds collection / map.
+type Hold struct {
+	// From is when the hold takes effect. A zero time passed to
+	// PlaceOnHold is treated as "now".
+	From time.Time
+
+	// To is when the hold naturally expires (exclusive — active while
+	// now < To).
+	To time.Time
+
+	// Reason is a human-readable label set by PlaceOnHold; surfaced as
+	// the hold-suppression reason at consult sites.
+	Reason string
+
+	// SetAt is the server-side timestamp at which the hold was placed,
+	// stamped by PlaceOnHold. Differentiates stacked holds with
+	// identical (From, To, Reason).
+	SetAt time.Time
+
+	// ClearedAt is zero on currently-active and naturally-expired
+	// entries; non-zero on entries explicitly cleared via
+	// ClearActiveHolds. Always zero on the Hold value returned by
+	// HasActiveHold (which filters cleared entries out).
+	ClearedAt time.Time
 }
 
 // ReadProtector is the root read-side gate for content-free operations — a
@@ -155,46 +201,87 @@ type ReadProtector interface {
 
 // ReadTenant is a [ReadProtector] bound to one tenant — the middle step in
 // the Tenant → Namespace chain. Pick a namespace with [ReadTenant.Namespace]
-// to get a [ReadNamespace], where Check / RecordAsSent / ReplayCandidates run.
-// Namespace handles minted from this ReadTenant stamp the bound tenant on
-// every entry / Metrics doc they write.
+// to get a [ReadNamespace], where CheckAndReserve / RecordAsSent /
+// ReplayCandidates run. Namespace handles minted from this ReadTenant stamp
+// the bound tenant on every entry / Metrics doc they write.
+//
+// Tenant-scoped hold operations ([ReadTenant.PlaceOnHold] /
+// [ReadTenant.ClearActiveHolds] / [ReadTenant.HasActiveHold]) live here
+// rather than on the namespace handle because a hold suppresses every
+// gated op for the bound tenant regardless of namespace — typical use is
+// honouring a downstream rate-limit response, where a single PlaceOnHold
+// at the tenant scope blocks every pipeline under that tenant (so a 429
+// on one pipeline doesn't keep firing on its siblings).
 type ReadTenant interface {
 	// Namespace returns a [ReadNamespace] scoped to ns ("" = the whole
-	// store). The returned handle is where gating happens — Check /
-	// RecordAsSent / ReplayCandidates all operate within ns and stamp the
-	// tenant bound on this ReadTenant alongside the namespace on every
-	// write they commit.
+	// store). The returned handle is where gating happens —
+	// CheckAndReserve / RecordAsSent / ReplayCandidates all operate
+	// within ns and stamp the tenant bound on this ReadTenant alongside
+	// the namespace on every write they commit.
 	Namespace(ns string) ReadNamespace
+
+	// PlaceOnHold appends a hold entry to the tenant's audit log,
+	// suppressing gated ops on this tenant from `from` (inclusive) until
+	// `to` (exclusive). `from.IsZero()` is treated as "now" by the
+	// storage layer. The append is atomic — concurrent PlaceOnHold calls
+	// each contribute their own entry; no caller-supplied id is needed.
+	// `reason` is surfaced via [HasActiveHold]'s returned [Hold.Reason]
+	// and intended as a short human-readable label.
+	PlaceOnHold(ctx context.Context, from, to time.Time, reason string) error
+
+	// ClearActiveHolds atomically stamps `ClearedAt = now` on every
+	// currently-active hold on this tenant (entries where
+	// `From ≤ now < To AND ClearedAt is zero`). Expired or
+	// already-cleared entries are left alone. The cleared entries remain
+	// in the audit array — the holds log is append-only — so the audit
+	// trail preserves both the original window and the manual clearance.
+	// The operator escape hatch and intended manual-unpause path.
+	ClearActiveHolds(ctx context.Context) error
+
+	// HasActiveHold reports whether this tenant has any currently-active
+	// hold. When `active` is true, `hold` is the most-restrictive active
+	// entry (the one with the latest `To` among active entries); when
+	// `active` is false, `hold` is the zero [Hold] value. Fails open on a
+	// store error — `(false, Hold{}, err)` — so a caller that treats
+	// `active=false` as "no hold" proceeds rather than blocking on a
+	// degraded backend (matching the existing read-gate fail-open policy).
+	HasActiveHold(ctx context.Context) (active bool, hold Hold, err error)
 }
 
-// ReadNamespace is a [ReadProtector] scoped to one namespace — where reads are
-// gated (Check / RecordAsSent) and swept (ReplayCandidates, within the
-// namespace). A capped Check is DEFERRED: a breadcrumb is stashed and a consumer
-// sweep re-takes the read against current state once the cap clears (the final
-// state is never lost — a dropped cap-suppression would lose it). Pair it with a
-// [pith/coalesce.NewTrailingEdgeDebounce] so a sustained burst collapses to a
-// single final read after quiet.
+// ReadNamespace is a [ReadProtector] scoped to one namespace — where reads
+// are gated (CheckAndReserve) and swept (ReplayCandidates, within the
+// namespace). A capped CheckAndReserve is DEFERRED: a breadcrumb is
+// stashed and a consumer sweep re-takes the read against current state
+// once the cap clears (the final state is never lost — a dropped
+// cap-suppression would lose it). Pair it with a
+// [pith/coalesce.NewTrailingEdgeDebounce] so a sustained burst collapses
+// to a single final read after quiet.
 type ReadNamespace interface {
-	Check(ctx context.Context, meta RequestMeta) Outcome
 	RecordAsSent(ctx context.Context, meta RequestMeta) error
 	ReplayCandidates(ctx context.Context, limit int) ([]DeferredRequest, error)
 
-	// CheckAndReserve is the atomic cap-discipline counterpart to Check
-	// + RecordAsSent: a single round-trip that evaluates every attached
-	// Coalescer and — on a Proceed — reserves a send-slot for the caller
-	// before they perform the gated read. The returned ReleaseFunc rolls
-	// the reservation back on op failure.
+	// RecordAsDeferred stamps a deferred breadcrumb on the entry,
+	// making it replay-eligible via [ReplayCandidates]. Mirror of
+	// [WriteNamespace.RecordAsDeferred] for the read gate; see that
+	// method's godoc for the use-cases.
+	RecordAsDeferred(ctx context.Context, meta RequestMeta) error
+
+	// CheckAndReserve evaluates every attached Coalescer and — on a
+	// Proceed — atomically reserves a send-slot for the caller before they
+	// perform the gated read. The returned ReleaseFunc rolls the
+	// reservation back on op failure.
 	//
 	// Two outcomes (DecisionProceed / DecisionDeferred) — never
 	// DecisionDeduped, because the read gate has no content to fingerprint.
-	// On a Deferred outcome the deferred breadcrumb is stamped, just as
-	// Check would: a consumer-side sweep (ReplayCandidates) re-takes the
-	// read once the cap clears.
+	// On a Deferred outcome the deferred breadcrumb is stamped: a
+	// consumer-side sweep (ReplayCandidates) re-takes the read once the
+	// cap clears.
 	//
 	// Fail-policy: a backing-store error returns DecisionDeferred + non-nil
-	// Outcome.Err (fail-closed — the replay sweep re-drives). Distinct from
-	// Check, which fails open. Use this method when the cap discipline
-	// matters (no overshoot tolerated) and accept the fail-closed posture.
+	// Outcome.Err (fail-closed — the replay sweep re-drives). Callers
+	// that prefer fail-open semantics (over-read rather than drop a
+	// legitimate fetch) override at the call site by treating Err as a
+	// proceed.
 	//
 	// ReleaseFunc is nil on Deferred. On Proceed it is non-nil; the caller
 	// invokes it only when the gated read subsequently fails — a successful
@@ -225,43 +312,94 @@ type WriteProtector interface {
 // the Tenant → Namespace chain. Pick a namespace with [WriteTenant.Namespace]
 // to get a [WriteNamespace]. Namespace handles minted from this WriteTenant
 // stamp the bound tenant on every entry / Metrics doc they write.
+//
+// Tenant-scoped hold operations ([WriteTenant.PlaceOnHold] /
+// [WriteTenant.ClearActiveHolds] / [WriteTenant.HasActiveHold]) live here
+// rather than on the namespace handle because a hold suppresses every
+// gated op for the bound tenant regardless of namespace — typical use is
+// honouring a downstream rate-limit response, where a single PlaceOnHold
+// at the tenant scope blocks every pipeline under that tenant (so a 429
+// on one pipeline doesn't keep firing on its siblings).
 type WriteTenant interface {
 	// Namespace returns a [WriteNamespace] scoped to ns ("" = the whole
 	// store). The returned handle is where gating happens and stamps the
 	// tenant bound on this WriteTenant alongside the namespace on every
 	// write it commits.
 	Namespace(ns string) WriteNamespace
+
+	// PlaceOnHold appends a hold entry to the tenant's audit log,
+	// suppressing gated ops on this tenant from `from` (inclusive) until
+	// `to` (exclusive). `from.IsZero()` is treated as "now" by the
+	// storage layer. The append is atomic — concurrent PlaceOnHold calls
+	// each contribute their own entry; no caller-supplied id is needed.
+	// `reason` is surfaced via [HasActiveHold]'s returned [Hold.Reason]
+	// and intended as a short human-readable label.
+	PlaceOnHold(ctx context.Context, from, to time.Time, reason string) error
+
+	// ClearActiveHolds atomically stamps `ClearedAt = now` on every
+	// currently-active hold on this tenant (entries where
+	// `From ≤ now < To AND ClearedAt is zero`). Expired or
+	// already-cleared entries are left alone. The cleared entries remain
+	// in the audit array — the holds log is append-only — so the audit
+	// trail preserves both the original window and the manual clearance.
+	// The operator escape hatch and intended manual-unpause path.
+	ClearActiveHolds(ctx context.Context) error
+
+	// HasActiveHold reports whether this tenant has any currently-active
+	// hold. When `active` is true, `hold` is the most-restrictive active
+	// entry (the one with the latest `To` among active entries); when
+	// `active` is false, `hold` is the zero [Hold] value. Fails open on
+	// a store error — `(false, Hold{}, err)` — so a caller treating
+	// `active=false` as "no hold" proceeds rather than blocking on a
+	// degraded backend (a missed hold-read costs at most one extra round
+	// of unsuppressed traffic before the next 429 re-arms).
+	HasActiveHold(ctx context.Context) (active bool, hold Hold, err error)
 }
 
 // WriteNamespace is a [WriteProtector] scoped to one namespace — where writes
-// are gated (Check / RecordAsSent) and swept (ReplayCandidates). A capped Check
-// is DEFERRED: the write is an action you still intend to perform, so a
-// breadcrumb is stashed for re-emission once the cap window clears. A
-// DecisionDeduped (identical content to the last send) is dropped, not
-// replayed.
+// are gated (CheckAndReserve) and swept (ReplayCandidates). A capped
+// CheckAndReserve is DEFERRED: the write is an action you still intend to
+// perform, so a breadcrumb is stashed for re-emission once the cap window
+// clears. A DecisionDeduped (identical content to the last send) is dropped,
+// not replayed.
 type WriteNamespace interface {
-	Check(ctx context.Context, meta RequestMeta, contentHash string) Outcome
 	RecordAsSent(ctx context.Context, meta RequestMeta, contentHash string) error
 	ReplayCandidates(ctx context.Context, limit int) ([]DeferredRequest, error)
 
-	// CheckAndReserve is the atomic cap-discipline counterpart to Check
-	// + RecordAsSent: a single round-trip that evaluates dedupe and every
-	// attached Coalescer and — on a Proceed — reserves a send-slot for the
-	// caller before they perform the gated write. The returned ReleaseFunc
+	// RecordAsDeferred stamps a deferred breadcrumb on the entry —
+	// LastDeferredMessageRef + LastNDeferredTimes — making the entry
+	// replay-eligible via [ReplayCandidates]. CheckAndReserve already
+	// stamps the breadcrumb internally when its policy chain defers,
+	// so this method exists for the cases where the protect-layer
+	// caller wants to defer EXPLICITLY (independent of the
+	// CheckAndReserve outcome):
+	//
+	//   - A wire-side rate-limit error after a Proceed reservation:
+	//     the caller calls the release closure to pop the
+	//     timestamp, then RecordAsDeferred to stamp the breadcrumb;
+	//     the replay sweep then re-drives the request once the
+	//     tenant's hold clears.
+	//   - A pre-CheckAndReserve tenant-level hold: every kept activity
+	//     gets a breadcrumb stamped so replay picks them up once the
+	//     hold clears.
+	//
+	// Best-effort: a store error is returned for logging; the entry
+	// just isn't replay-eligible.
+	RecordAsDeferred(ctx context.Context, meta RequestMeta) error
+
+	// CheckAndReserve evaluates dedupe and every attached Coalescer and
+	// — on a Proceed — atomically reserves a send-slot for the caller
+	// before they perform the gated write. The returned ReleaseFunc
 	// rolls the reservation back on op failure.
 	//
-	// Three outcomes (DecisionProceed / DecisionDeduped / DecisionDeferred),
-	// matching Check. On a Deduped outcome the caller drops the operation;
-	// on a Deferred outcome the deferred breadcrumb is stamped (just as
-	// Check would), and a consumer-side sweep (ReplayCandidates) re-emits
-	// once the cap clears.
+	// Three outcomes (DecisionProceed / DecisionDeduped / DecisionDeferred).
+	// On a Deduped outcome the caller drops the operation; on a Deferred
+	// outcome the deferred breadcrumb is stamped, and a consumer-side
+	// sweep (ReplayCandidates) re-emits once the cap clears.
 	//
 	// Fail-policy: a backing-store error returns DecisionDeferred + non-nil
-	// Outcome.Err (fail-closed — the replay sweep re-drives). Distinct from
-	// Check, which fails open. Use this method when cap discipline matters
-	// (no overshoot tolerated, e.g. a hard downstream quota) and accept the
-	// fail-closed posture; use Check + RecordAsSent when an advisory cap is
-	// enough and the legacy fail-open is preferred.
+	// Outcome.Err (fail-closed — the replay sweep re-drives). Cap
+	// discipline holds even when the backing store flaps.
 	//
 	// ReleaseFunc is nil on Deduped / Deferred. On Proceed it is non-nil;
 	// the caller invokes it only on op failure — a successful op leaves the
